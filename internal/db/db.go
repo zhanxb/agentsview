@@ -601,7 +601,18 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // (143: keep each repeated antigravity-cli history.jsonl prompt as its own
 // turn when the SQLite decode missed it. Re-parse unchanged antigravity-cli
 // sources in place; source and session identities are unchanged.)
-const dataVersion = 143
+// (144: reconcile Hermes and Augure Desktop model usage in place.)
+// (145: restore Claude-format channel messages in place, retaining retry identities.)
+// (146: retain explicit dialogue classification for visible conversation exports.)
+// (147: keep one tool call per VS Code toolCallId so transcripts render. Re-parse
+// VS Code-format sources in place; source and session identities are unchanged.)
+// (148: link ordinary Codex forks to the thread named by forked_from_id. Re-parse
+// Codex-format sources in place; source and session identities are unchanged.)
+// (149: reparse Command Code v3 transcripts, token usage, and fork links in place.)
+// (150: keep token usage on Claude assistant records that render no text, such
+// as blank thinking. Re-parse Claude-format sources in place; source and
+// session identities are unchanged.)
+const dataVersion = 150
 
 const archiveOnlyVersionBase = 1 << 20
 
@@ -1930,6 +1941,9 @@ var readOnlyRequiredTables = []string{
 	"model_pricing_bands",
 	"genai_pricing",
 	"secret_findings",
+	"friction_digests",
+	"friction_digest_sessions",
+	"friction_patterns",
 	"recall_entries",
 	"recall_evidence",
 	"recall_query_events",
@@ -3824,6 +3838,9 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_friction_rules_version
 		 ON sessions(friction_rules_version)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_friction_activity
+		 ON sessions(COALESCE(NULLIF(ended_at, ''), NULLIF(started_at, '')))
+		 WHERE deleted_at IS NULL`,
 	}
 	for _, ddl := range indexes {
 		if _, err := w.Exec(ctx, ddl); err != nil {

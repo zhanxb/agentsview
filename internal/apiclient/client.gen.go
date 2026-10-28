@@ -25608,7 +25608,7 @@ type SyncWatchRecoveryScope struct {
 
 type SyncWatchRename struct {
 	Agent    *string `json:"agent,omitempty"`
-	ItemType *int32  `json:"item_type,omitempty" validate:"omitempty,gte=0"`
+	ItemType *int32  `json:"item_type,omitempty" validate:"omitempty,gte=0,lte=255"`
 	Path     string  `json:"path" validate:"required"`
 	Root     *string `json:"root,omitempty"`
 }
@@ -25795,6 +25795,7 @@ type VersionInfo struct {
 	BuildDate                  string `json:"build_date" validate:"required"`
 	Commit                     string `json:"commit" validate:"required"`
 	DataVersion                int64  `json:"data_version"`
+	FrictionAvailable          bool   `json:"friction_available"`
 	InsightGenerationAvailable bool   `json:"insight_generation_available"`
 	ReadOnly                   *bool  `json:"read_only,omitempty"`
 	SessionStatsAvailable      bool   `json:"session_stats_available"`

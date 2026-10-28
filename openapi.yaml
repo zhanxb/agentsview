@@ -7829,6 +7829,7 @@ components:
           type: string
         item_type:
           format: int32
+          maximum: 255
           minimum: 0
           type: integer
         path:
@@ -8160,6 +8161,8 @@ components:
         data_version:
           format: int64
           type: integer
+        friction_available:
+          type: boolean
         insight_generation_available:
           type: boolean
         read_only:
@@ -8174,6 +8177,7 @@ components:
         - build_date
         - insight_generation_available
         - session_stats_available
+        - friction_available
         - api_version
         - data_version
       type: object

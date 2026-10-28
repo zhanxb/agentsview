@@ -48,9 +48,8 @@ func (s *Server) registerImportRoutes() {
 			return s.humaSyncClaudeAI(ctx, in, &results)
 		}, func(op *huma.Operation) {
 			op.Middlewares = append(op.Middlewares, func(ctx huma.Context, next func(huma.Context)) {
-				// Read the parameter the way Huma binds it. net/url takes the
-				// first of repeated keys, but Huma's parser can pick a later
-				// one, so ?browser&browser=chrome would skip this check.
+				// Huma binds the first value and treats a valueless key as
+				// "true", so this matches the browser field the handler sees.
 				if ctx.Query("browser") == "chrome" {
 					localChrome(ctx, next)
 					return
@@ -176,7 +175,7 @@ func (s *Server) humaSyncClaudeAI(ctx context.Context, in *claudeAISyncInput, re
 		}
 		stats, err := importer.SyncClaudeAI(ctx, store, fetch, &importer.ImportCallbacks{
 			SerializeWrite: func(write func() error) error {
-				return s.serializeArchiveWrite(ctx, write)
+				return s.SerializeArchiveWrite(ctx, write)
 			},
 			OnProgress: func(stats importer.ImportStats) {
 				if !stream.SendJSON("progress", stats) {
@@ -290,7 +289,7 @@ func (s *Server) importClaudeAIFromFileWithCallbacks(
 	}
 	defer cleanup()
 	var stats importer.ImportStats
-	err = s.serializeArchiveWrite(ctx, func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var importErr error
 		stats, importErr = importer.ImportClaudeAIWithOptions(ctx, s.db, reader, cb, opts)
 		return importErr
@@ -433,7 +432,7 @@ func (s *Server) importChatGPTFromFile(
 	}
 	defer cleanup()
 	var stats importer.ImportStats
-	err = s.serializeArchiveWrite(ctx, func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var importErr error
 		stats, importErr = importer.ImportChatGPTWithOptions(ctx, s.db, dir,
 			filepath.Join(s.cfg.DataDir, "assets"), cb, opts)
