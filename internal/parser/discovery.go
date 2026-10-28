@@ -172,6 +172,17 @@ var (
 		agent: AgentIcodemate, dbName: "icodemate.db",
 		sessionSubdir: "session_diff",
 	}
+	// CodeFree-O is the China Telecom R&D Cloud agent built on the OpenCode
+	// core. It keeps the OpenCode SQLite schema under its own data root as
+	// codefree.db, and its storage tree holds per-session diffs under
+	// storage/session_diff. That tree carries diffs, not session JSON, and
+	// the SQLite container is the only session source -- the same shape
+	// modern OpenCode has, so the session subdirectory stays "session" and
+	// the root resolves to SQLite mode.
+	codefreeOFmt = openCodeFormat{
+		agent: AgentCodeFreeO, dbName: "codefree.db",
+		sessionSubdir: "session",
+	}
 )
 
 func resolveOpenCodeFormatSource(
@@ -478,6 +489,26 @@ func ResolveMiMoCodeWatchRoots(root string) []string {
 
 func MiMoCodeSQLiteVirtualPath(dbPath, sessionID string) string {
 	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+// ResolveCodeFreeOSource detects whether a CodeFree-O root is using
+// file-backed storage or SQLite storage.
+func ResolveCodeFreeOSource(root string) OpenCodeSource {
+	return resolveOpenCodeFormatSource(codefreeOFmt, root)
+}
+
+func ResolveCodeFreeOWatchRoots(root string) []string {
+	return resolveOpenCodeFormatWatchRoots(codefreeOFmt, root)
+}
+
+func CodeFreeOSQLiteVirtualPath(dbPath, sessionID string) string {
+	return OpenCodeSQLiteVirtualPath(dbPath, sessionID)
+}
+
+func ParseCodeFreeOSQLiteVirtualPath(
+	sourcePath string,
+) (dbPath, sessionID string, ok bool) {
+	return parseOpenCodeFormatVirtualPath(codefreeOFmt.dbName, sourcePath)
 }
 
 // ResolveCodexShallowWatchRoots returns directories that should be watched

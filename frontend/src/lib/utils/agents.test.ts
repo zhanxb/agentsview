@@ -71,6 +71,7 @@ describe("KNOWN_AGENTS", () => {
       "freebuff",
       "crush",
       "muse",
+      "codefree-o",
     ]);
   });
 
@@ -118,6 +119,7 @@ describe("agentColor", () => {
     expect(agentColor("cline")).toBe("var(--accent-violet)");
     expect(agentColor("crush")).toBe("var(--accent-coral)");
     expect(agentColor("muse")).toBe("var(--accent-sky)");
+    expect(agentColor("codefree-o")).toBe("var(--accent-cyan)");
   });
 
   it("falls back to blue for unknown agents", () => {

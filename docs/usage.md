@@ -404,7 +404,8 @@ Each session item shows:
   Claude Code (`/rename` names and generated titles), Codex
   (`session_index.jsonl` thread names), Qwen Code, Copilot CLI (`workspace.yaml`
   names), Gemini CLI (generated summaries), Kimi CLI, OpenClaw, OpenCode, Kilo,
-  MiMo Code, Amp, VS Code Copilot, Positron, Windsurf, Kiro, Claude.ai and
+  MiMo Code, CodeFree-O, Amp, VS Code Copilot, Positron, Windsurf, Kiro,
+  Claude.ai and
   ChatGPT conversation names, Forge, Hermes, Piebald, Cortex Code, WorkBuddy,
   and Command Code. The first message stays the first thing you typed; a title
   stands in for it only when a session has no user message. Manual in-app

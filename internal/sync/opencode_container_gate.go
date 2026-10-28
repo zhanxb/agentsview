@@ -27,6 +27,7 @@ var openCodeFamilySQLiteAgents = []parser.AgentType{
 	parser.AgentKilo,
 	parser.AgentMiMoCode,
 	parser.AgentIcodemate,
+	parser.AgentCodeFreeO,
 }
 
 var statSQLiteContainerState = parser.StatSQLiteContainerState

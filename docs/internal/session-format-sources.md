@@ -4085,6 +4085,33 @@ schemas keep their existing ordering behavior.
   unchanged S3 transcripts use that persisted all-branch state to skip object
   downloads.
 
+## CodeFree-O (`codefree-o`)
+
+- **Format:** OpenCode-compatible SQLite container named `codefree.db` under
+  `.codefree-o/.local/share`, with the same `session`, `message`, `part`,
+  `project`, and `project_directory` tables as OpenCode. A flat
+  `storage/session_diff` tree holds per-session file-diff JSON sidecars
+  (`file`/`patch` records), not session transcripts. No file-backed session
+  JSON exists, so the SQLite container is the only session source. An extra
+  `cron_task` table is present but not consumed.
+- **Evidence:** `no-public-source`.
+- **Upstream:** CodeFree-O is a China Telecom R&D Cloud coding agent built on
+  the OpenCode core. Its first-party product pages, documentation, and public
+  repository search were checked 2026-10-28 without finding producer source or
+  an authoritative disk schema. Format evidence comes from inspecting a local
+  installation: the `codefree.db` schema matches the OpenCode tables pinned in
+  the `opencode` entry, and message and part JSON payloads carry the same
+  role, model, token, tool-state, and step-finish shapes that the OpenCode
+  parser decodes.
+- **Usage and cost:** Assistant message data persists input, output, reasoning,
+  cache-read, cache-write, model, and a calculated currency cost. Agentsview
+  reads the token and model fields but deliberately ignores the stored cost
+  and catalog-prices the normalized usage, matching OpenCode handling.
+- **Agentsview:** `internal/parser/codefreeo.go` delegates to
+  `internal/parser/opencode.go`; sessions relabel onto the `codefree-o:`
+  prefix. Compare CodeFree-O's pinned schema with OpenCode whenever their
+  shared parser changes.
+
 ## WorkBuddy (`workbuddy`)
 
 - **Format:** Session JSONL with provider-specific raw usage embedded under

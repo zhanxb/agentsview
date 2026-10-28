@@ -93,6 +93,7 @@ const (
 	AgentFreebuff       AgentType = "freebuff"
 	AgentCrush          AgentType = "crush"
 	AgentMuse           AgentType = "muse"
+	AgentCodeFreeO      AgentType = "codefree-o"
 )
 
 const AgentDeepSeekHarness AgentType = "deepseek-harness"
@@ -313,6 +314,27 @@ var Registry = []AgentDef{
 		},
 		FileBased:      true,
 		WatchRootsFunc: ResolveOpenCodeWatchRoots,
+	},
+	{
+		// CodeFree-O is the China Telecom R&D Cloud agent built on the
+		// OpenCode core. It keeps its own data root under
+		// ~/.codefree-o/.local/share and writes the same SQLite schema as
+		// OpenCode (codefree.db) plus a storage/session_diff tree of
+		// per-session diffs, so the OpenCode-format provider parses it and
+		// relabels the session IDs onto the codefree-o: prefix.
+		Type:        AgentCodeFreeO,
+		DisplayName: "CodeFree-O",
+		EnvVar:      "CODEFREEO_DIR",
+		ConfigKey:   "codefreeo_dirs",
+		DefaultDirs: []string{".codefree-o/.local/share"},
+		IDPrefix:    "codefree-o:",
+		WatchSubdirs: []string{
+			"storage/session_diff",
+			"storage/message",
+			"storage/part",
+		},
+		FileBased:      true,
+		WatchRootsFunc: ResolveCodeFreeOWatchRoots,
 	},
 	{
 		Type:        AgentOpenCodeReview,

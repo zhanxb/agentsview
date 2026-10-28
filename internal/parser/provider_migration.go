@@ -33,6 +33,7 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentKilo:           ProviderMigrationProviderAuthoritative,
 	AgentKiloLegacy:     ProviderMigrationProviderAuthoritative,
 	AgentIcodemate:      ProviderMigrationProviderAuthoritative,
+	AgentCodeFreeO:      ProviderMigrationProviderAuthoritative,
 	AgentIflow:          ProviderMigrationProviderAuthoritative,
 	AgentAmp:            ProviderMigrationProviderAuthoritative,
 	AgentJunie:          ProviderMigrationProviderAuthoritative,

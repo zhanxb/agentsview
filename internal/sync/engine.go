@@ -3275,6 +3275,7 @@ func (e *Engine) resyncBuildLocked(
 			{Agent: string(parser.AgentOpenCode)},
 			{Agent: string(parser.AgentKilo)},
 			{Agent: string(parser.AgentMiMoCode)},
+			{Agent: string(parser.AgentCodeFreeO)},
 			{
 				Agent: string(parser.AgentIcodemate),
 				KeepJSONLRows: !slices.Contains(
@@ -4484,6 +4485,7 @@ func protectedFileSessionCount(ctx context.Context,
 		parser.AgentOpenCode,
 		parser.AgentKilo,
 		parser.AgentMiMoCode,
+		parser.AgentCodeFreeO,
 	} {
 		count -= countRootSessionsForAgent(ctx,
 			database, agent, machine, idPrefix, scoped,
@@ -6845,7 +6847,8 @@ func reconciliationSourceIdentity(agent parser.AgentType, source parser.SourceRe
 
 func isOpenCodeFormatAgent(agent parser.AgentType) bool {
 	switch agent {
-	case parser.AgentOpenCode, parser.AgentKilo, parser.AgentMiMoCode, parser.AgentIcodemate:
+	case parser.AgentOpenCode, parser.AgentKilo, parser.AgentMiMoCode,
+		parser.AgentIcodemate, parser.AgentCodeFreeO:
 		return true
 	default:
 		return false
@@ -20378,6 +20381,8 @@ func resolveOpenCodeFormatSource(
 		return parser.ResolveMiMoCodeSource(dir)
 	case parser.AgentIcodemate:
 		return parser.ResolveIcodemateSource(dir)
+	case parser.AgentCodeFreeO:
+		return parser.ResolveCodeFreeOSource(dir)
 	default:
 		return parser.OpenCodeSource{}
 	}
@@ -20395,6 +20400,8 @@ func openCodeFormatSourceMtime(ctx context.Context,
 		return parser.MiMoCodeSourceMtime(ctx, path)
 	case parser.AgentIcodemate:
 		return parser.IcodemateSourceMtime(ctx, path)
+	case parser.AgentCodeFreeO:
+		return parser.CodeFreeOSourceMtime(ctx, path)
 	default:
 		return 0, fmt.Errorf("unknown OpenCode-format agent: %s", agent)
 	}

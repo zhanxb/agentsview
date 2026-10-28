@@ -105,7 +105,8 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		agent := factory.Definition().Type
 		got := factory.Capabilities().Source.ChangedPathRelevance
 		if agent == AgentOpenCode || agent == AgentKilo ||
-			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
+			agent == AgentMiMoCode || agent == AgentIcodemate ||
+			agent == AgentCodeFreeO || agent == AgentJunie ||
 			agent == AgentCodebuff || agent == AgentVibe ||
 			agent == AgentAntigravityCLI || agent == AgentAntigravity ||
 			agent == AgentGemini {
