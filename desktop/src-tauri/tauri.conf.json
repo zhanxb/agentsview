@@ -55,9 +55,7 @@
     },
     "updater": {
       "pubkey": "NOT_SET",
-      "endpoints": [
-        "https://github.com/wesm/agentsview/releases/download/updater/latest.json"
-      ]
+      "endpoints": []
     }
   }
 }
