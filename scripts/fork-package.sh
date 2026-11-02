@@ -33,8 +33,20 @@ done
 CURL=(curl -s --max-time 60)
 [ -n "$PROXY" ] && CURL+=(--proxy "$PROXY")
 
-PY="$(command -v python3 || command -v python || true)"
-[ -z "$PY" ] && { echo "需要 python 来解析 JSON" >&2; exit 2; }
+# Python 只用来解析 API 返回的 JSON；Windows 上 py -3 也认
+PY_BIN=""; PY_ARGS=()
+if command -v python3 >/dev/null 2>&1; then
+  PY_BIN=python3
+elif command -v python >/dev/null 2>&1; then
+  PY_BIN=python
+elif command -v py >/dev/null 2>&1; then
+  PY_BIN=py; PY_ARGS=(-3)
+fi
+if [ -z "$PY_BIN" ]; then
+  echo "找不到 Python（用于解析 GitHub API 返回的 JSON）。" >&2
+  echo "装一个即可：winget install Python.Python.3.13" >&2
+  exit 2
+fi
 
 TOKEN="$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill 2>/dev/null | sed -n 's/^password=//p')"
 if [ -z "$TOKEN" ]; then
@@ -79,7 +91,7 @@ fi
 
 # 找最近一次 workflow_dispatch 运行
 RUN_ID="$(api GET "/repos/$REPO/actions/workflows/$WORKFLOW/runs?event=workflow_dispatch&per_page=1" \
-  | "$PY" -c 'import sys,json; d=json.load(sys.stdin); r=(d.get("workflow_runs") or [None])[0]; print(r["id"] if r else "")')"
+  | "$PY_BIN" ${PY_ARGS[@]+"${PY_ARGS[@]}"} -c 'import sys,json; d=json.load(sys.stdin); r=(d.get("workflow_runs") or [None])[0]; print(r["id"] if r else "")')"
 
 if [ -z "$RUN_ID" ]; then
   echo "没找到运行实例。用 push 触发也可以：直接 git push 后重跑本脚本 --status" >&2
@@ -96,7 +108,7 @@ elapsed=0
 last_state=""
 while :; do
   JSON="$(api GET "/repos/$REPO/actions/runs/$RUN_ID")"
-  read -r STATUS CONCLUSION <<<"$(echo "$JSON" | "$PY" -c 'import sys,json; r=json.load(sys.stdin); print(r.get("status") or "-", r.get("conclusion") or "-")')"
+  read -r STATUS CONCLUSION <<<"$(echo "$JSON" | "$PY_BIN" ${PY_ARGS[@]+"${PY_ARGS[@]}"} -c 'import sys,json; r=json.load(sys.stdin); print(r.get("status") or "-", r.get("conclusion") or "-")')"
 
   if [ "$STATUS" != "$last_state" ]; then
     echo "    [$((elapsed/60))m] $STATUS"
@@ -111,7 +123,7 @@ done
 
 echo
 echo "==> 各任务结果"
-api GET "/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=20" | "$PY" -c '
+api GET "/repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=20" | "$PY_BIN" ${PY_ARGS[@]+"${PY_ARGS[@]}"} -c '
 import sys, json
 d = json.load(sys.stdin)
 for j in d.get("jobs", []):
@@ -121,7 +133,7 @@ for j in d.get("jobs", []):
 echo
 echo "==> 产物"
 ART_JSON="$(api GET "/repos/$REPO/actions/runs/$RUN_ID/artifacts")"
-echo "$ART_JSON" | "$PY" -c '
+echo "$ART_JSON" | "$PY_BIN" ${PY_ARGS[@]+"${PY_ARGS[@]}"} -c '
 import sys, json
 d = json.load(sys.stdin)
 for a in d.get("artifacts", []):
@@ -129,7 +141,7 @@ for a in d.get("artifacts", []):
 '
 
 if [ "$DO_DOWNLOAD" = "1" ] && [ "$CONCLUSION" = "success" ]; then
-  WIN_ID="$(echo "$ART_JSON" | "$PY" -c '
+  WIN_ID="$(echo "$ART_JSON" | "$PY_BIN" ${PY_ARGS[@]+"${PY_ARGS[@]}"} -c '
 import sys, json
 d = json.load(sys.stdin)
 for a in d.get("artifacts", []):

@@ -35,6 +35,45 @@
 
 ---
 
+## 0.5 两个脚本在哪运行（容易误解，先说清）
+
+| 脚本 | 实际执行位置 | 干什么 |
+| --- | --- | --- |
+| `scripts/fork-verify.sh` | **你的电脑** | 编译、检查 12 处注册点、跑单元测试，全部在本地完成 |
+| `scripts/fork-package.sh` | **你的电脑**发起 | 调 GitHub API 触发云端构建，再轮询进度。**编译打包在 GitHub 服务器上跑**，本机只发命令、收结果 |
+
+`fork-package.sh` 自己不做任何构建：真正的 `go build` / `npm run build` / `tauri build`
+发生在 `.github/workflows/desktop-artifacts.yml` 定义的 GitHub 托管机器上。所以本机不需要
+Rust，也不需要能链接 libduckdb。脚本退出或关掉终端都不影响云端构建，只是不再显示进度
+（进度可以去 Actions 页面看）。
+
+### Windows 11 上怎么运行
+
+两个都是 bash 脚本，**不能双击，也不能在 PowerShell 里直接写 `./scripts/xxx.sh`**。
+两种可行方式：
+
+方式一，用 Git Bash（推荐，一次学会长期用）：开始菜单搜 **Git Bash**，然后
+
+```bash
+cd /d/AppWorkspace/GoWorkspace/agentsview
+./scripts/fork-verify.sh --with-frontend
+```
+
+方式二，在 PowerShell 里借用 Git 自带的 bash（本机 Git 装在 `D:\DevelopmentKit\Git`）：
+
+```powershell
+& "D:\DevelopmentKit\Git\bin\bash.exe" -c "cd /d/AppWorkspace/GoWorkspace/agentsview && ./scripts/fork-verify.sh"
+```
+
+依赖条件：
+
+- `fork-verify.sh` 需要 Go 与 GCC，脚本会自动找 `C:\Program Files\Go\bin` 和 MinGW 便携版目录；
+- `fork-package.sh` 需要 Python（解析 JSON，`py -3` 也认）、curl（Windows 10 以上自带）、
+  已保存的 GitHub 凭据（执行过一次 `git push` 就有）、以及 10808 代理在运行
+  （不想用代理就 `PROXY=none ./scripts/fork-package.sh`）。
+
+---
+
 ## 1. 同步上游 tag（6 步）
 
 ```bash

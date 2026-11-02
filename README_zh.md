@@ -115,6 +115,9 @@ git push origin main
 Windows 上有一批依赖符号链接权限的既有失败，以及 `libduckdb` 无法用 MinGW 链接的问题，
 都不影响结论——脚本已按基线处理，详见 FORK_SYNC.md 第 4 节。
 
+> 脚本是 bash 脚本，Windows 上要在 **Git Bash** 里运行（不能双击，也不能在 PowerShell 里直接
+> `./xxx.sh`）。具体两种运行方式和依赖见 FORK_SYNC.md 的「0.5 两个脚本在哪运行」。
+
 ### 上游改了 OpenCode 家族怎么办
 
 上游对 OpenCode 解析器（`internal/parser/opencode.go` 等）的修复会自动惠及
