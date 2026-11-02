@@ -88,3 +88,6 @@ graphify-out/
 # roborev snapshots
 /.roborev/
 .env*
+
+# WorkBuddy 工作区（本地记忆与自动化，不进版本库）
+.workbuddy/

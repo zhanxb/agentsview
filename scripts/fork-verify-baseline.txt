@@ -1,0 +1,46 @@
+# fork-verify 环境性失败基线（Windows 本机，非代码缺陷）
+#
+# 生成方式：./scripts/fork-verify.sh --update-baseline
+# 判定逻辑：本次失败集合 ⊆ 基线 = 通过；出现基线外的新失败 = 报警（可能是合并回归）
+#
+# 换机器、或在本机开启 Windows「开发人员模式」后，部分项会消失，
+# 届时脚本会提示"可清理"，重新执行 --update-baseline 即可。
+#
+# 根因分类：
+#   [symlink] Windows 创建符号链接需要 SeCreateSymbolicLinkPrivilege，
+#             普通用户默认没有 → 设置 → 开发者选项 → 开发人员模式可开启
+#   [io]      模拟 IO 错误 / 权限错误的用例，在 Windows 上行为与 Linux 不同
+#   [concur]  并发时序用例，Windows 调度粒度导致偶发
+
+# ---- internal/parser（14）----
+parser:TestClaudeProviderScopedDiscoveryBoundsTraversal                  # [symlink]
+parser:TestCodexThreadNameReadsAliasHomeIndex                            # [symlink]
+parser:TestCodexThreadNameAliasOnlyIndex                                 # [symlink]
+parser:TestCodexAliasHomesShareHintsAndWatchIndexes                      # [symlink]
+parser:TestCodexRawCaptureIncludesAliasHomeIndexes                       # [symlink]
+parser:TestCodexProvidersKeepIndependentMetadata                         # [symlink]
+parser:TestCoworkStreamingDiscoveryPropagatesSubagentCandidateStatError  # [symlink]
+parser:TestCursorStreamingDiscoveryPropagatesAuthoritativeResolutionErrors # [symlink]
+parser:TestEvenerProviderRejectsSymlinkCompanions                        # [symlink]
+parser:TestEvenerProviderUnavailableParentRetainsChild                   # [symlink]
+parser:TestEvenerProviderParentMetadataFingerprint                       # [symlink]
+parser:TestEvenerVerifiedForkPrefix                                      # [symlink]
+parser:TestJSONLSourceSetStreamingDiscoveryPropagatesTraversalErrors     # [symlink]
+parser:TestQoderSessionRoot                                              # [symlink]
+
+# ---- internal/sync（4）----
+sync:TestCodexSidecarSignatureCoversAliasHomeIndexes                     # [symlink]
+sync:TestReconcileWatchRootsAuthoritativeIOErrorsDoNotFalseTombstone     # [io]
+sync:TestFSNotifyBackendDeferredReplacementRecovery                      # [symlink]
+sync:TestQoderTitleAfterProjectsMoveAndSourceReload                      # [symlink]
+
+# ---- internal/db（1）----
+db:TestUsageCacheGenerationPublishesConcurrently                         # [concur]
+
+# ---- internal/rawarchive（6）----
+rawarchive:TestCaptureDoesNotPublishFailure                              # [symlink]
+rawarchive:TestCaptureRejectsDuplicateSelectedRoots                      # [symlink]
+rawarchive:TestRecoveryRejectsRepositorySymlinkInsideSource              # [symlink]
+rawarchive:TestSeededReparseAcceptsEquivalentSymlinkSpelling             # [symlink]
+rawarchive:TestCaptureRejectsAliasInferredFromDescendantLink             # [symlink]
+rawarchive:TestRepeatedCapturePreservesRootOriginalPath                  # [symlink]

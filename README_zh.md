@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-28
+last_edited: 2026-11-02
 ---
 
 # agentsview 中文说明（fork 版）
@@ -67,53 +67,53 @@ git remote -v
 # upstream  https://github.com/kenn-io/agentsview.git (fetch)
 ```
 
-### 日常同步步骤
+### 日常同步（跟 tag，不跟 main）
 
-上游（kenn-io/agentsview）发布新版本后，按下面步骤把代码合并进你的 fork：
-
-```bash
-# 1. 确认本地工作区是干净的
-git status
-
-# 2. 拉取上游最新代码
-git fetch upstream
-
-# 3. 看看上游新增了什么
-git log main..upstream/main --oneline
-
-# 4. 合并上游 main 到你的 main
-git merge upstream/main
-
-# 5. 解决冲突（如果有），然后完成合并
-#    冲突文件可参照上面"CodeFree-O 支持说明"的清单定位
-git add -A
-git commit
-```
-
-推送到自己的 fork：
+完整流程、版本号规则、冲突处理、已知环境性失败清单都在 **[FORK_SYNC.md](FORK_SYNC.md)**。
+这里只列命令主干：
 
 ```bash
+# 1. 确认工作区干净，并留一个回退点
+git status --short
+git branch -f backup-before-sync-$(date +%Y%m%d) HEAD
+
+# 2. 拉取上游 tag，确认最新正式版本
+git fetch upstream --tags
+git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -3
+
+# 3. 合并该 tag（示例为 v0.47.0，换成实际最新 tag）
+git merge v0.47.0 --no-edit
+
+# 4. 把 desktop/src-tauri/tauri.conf.json 的 version 改成 0.47.0
+#    同时确认 updater 的 "endpoints": [] 还在
+
+# 5. 验证：只关心"新增失败"，基线内的环境性失败自动忽略
+./scripts/fork-verify.sh --with-frontend
+
+# 6. 推送并触发云端打包（不下载产物）
 git push origin main
+./scripts/fork-package.sh
 ```
 
 ### 合并后必须验证
 
-合并后跑一遍测试，确认 CodeFree-O 支持没有被上游改动破坏：
+一条命令即可：
 
 ```bash
-# Go 测试（需要 Go 1.2x 和支持 CGO 的编译器，见下文"构建环境"）
-export PATH="/c/Users/zhanxb/.workbuddy/binaries/mingw64/mingw64/bin:/c/Program Files/Go/bin:$PATH"
-CGO_ENABLED=1 go test -tags "fts5" ./internal/parser/ -run "CodeFreeO"
-
-# 全量编译
-go build ./cmd/...
-
-# 前端测试（在 frontend/ 目录下）
-cd frontend && npx vp test run src/lib/utils/agents.test.ts
+./scripts/fork-verify.sh --with-frontend
 ```
 
-`internal/parser/` 全量测试在 Windows 上有若干依赖符号链接权限的既有失败，
-与本次改动无关，可以忽略；关键看 `CodeFreeO` 相关测试是否通过。
+它会做 gofmt / vet / 编译、**逐个检查 12 处 CodeFree-O 注册点是否被上游覆盖**、
+校验版本号与 tag 一致，再跑测试并把失败与基线比对。
+
+只想快速确认 CodeFree-O 还能用：
+
+```bash
+./scripts/fork-verify.sh --quick
+```
+
+Windows 上有一批依赖符号链接权限的既有失败，以及 `libduckdb` 无法用 MinGW 链接的问题，
+都不影响结论——脚本已按基线处理，详见 FORK_SYNC.md 第 4 节。
 
 ### 上游改了 OpenCode 家族怎么办
 
@@ -166,8 +166,19 @@ CGO_ENABLED=1 go build -tags fts5 -o agentsview.exe ./cmd/agentsview
 
 ### 方式一：GitHub Actions 云端构建（推荐，无需本地 Rust）
 
-仓库自带工作流 `.github/workflows/desktop-artifacts.yml`，支持手动触发，会构建
-Windows（NSIS 安装包）和 Linux（AppImage）产物。在你的 fork 页面上：
+一条命令触发并等到结果，产物不下载：
+
+```bash
+./scripts/fork-package.sh              # 触发 + 轮询 + 报告结论
+./scripts/fork-package.sh --download   # 顺便把 Windows 安装包下到 ~/Downloads
+./scripts/fork-package.sh --status     # 只看最近一次运行
+```
+
+脚本做的是：调用 GitHub API 触发 `.github/workflows/desktop-artifacts.yml`，
+轮询到结束，打印三个平台的任务结论与产物清单。
+
+也可以手工操作。仓库自带工作流 `.github/workflows/desktop-artifacts.yml`，支持手动触发，
+会构建 Windows（NSIS 安装包）和 Linux（AppImage）产物。在你的 fork 页面上：
 
 1. 打开 **Actions** 标签页；
 2. 左侧选择 **Desktop Artifacts**；
