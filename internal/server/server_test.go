@@ -27,6 +27,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 
 	"go.kenn.io/agentsview/internal/clickhouse"
 	"go.kenn.io/agentsview/internal/config"
@@ -337,7 +338,7 @@ func (te *testEnv) writeSessionFile(
 
 func waitForPort(port int, timeout time.Duration) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	dialer := &net.Dialer{Timeout: 50 * time.Millisecond}
+	dialer := &net.Dialer{Timeout: time.Second}
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	timer := time.NewTimer(timeout)
@@ -435,6 +436,7 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 			require.FailNowf(t, "test failed", "server failed to start: %v", serveErr)
 		default:
 		}
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "server not ready after 2s: %v", err)
 	}
 
@@ -445,6 +447,9 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 		defer cancel()
 		if err := te.srv.Shutdown(ctx); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
+			if errors.Is(err, context.DeadlineExceeded) {
+				stacktest.Dump(t)
+			}
 			assert.Failf(t, "test failed", "server shutdown error: %v", err)
 		}
 		select {
@@ -457,6 +462,7 @@ func (te *testEnv) listenAndServe(t *testing.T) string {
 				)
 			}
 		case <-time.After(5 * time.Second):
+			stacktest.Dump(t)
 			assert.Fail(t, "timed out waiting for server goroutine")
 		}
 	})
@@ -474,7 +480,7 @@ func TestListenAndServeUsesAvailablePortOutsideFixedRange(t *testing.T) {
 			continue
 		}
 
-		conn, dialErr := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(
+		conn, dialErr := (&net.Dialer{Timeout: time.Second}).DialContext(
 			t.Context(), "tcp", addr,
 		)
 		if dialErr != nil {
@@ -1403,6 +1409,7 @@ func (te *testEnv) waitForSSEEvent(t *testing.T, w *flushRecorder, expectedEvent
 		case <-time.After(remaining):
 		}
 	}
+	stacktest.Dump(t)
 	require.FailNowf(t, "test failed", "timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
 }
 
@@ -1441,6 +1448,7 @@ func (te *testEnv) emitUntilSSEEvent(
 		case <-time.After(remaining):
 		}
 	}
+	stacktest.Dump(t)
 	require.FailNowf(t, "test failed", "timed out waiting for event: %s, got: %s", expectedEvent, w.BodyString())
 }
 
@@ -4814,6 +4822,7 @@ func (f *flushRecorder) WaitForWrite(t *testing.T) {
 	select {
 	case <-f.writes:
 	case <-time.After(5 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for response write")
 	}
 }

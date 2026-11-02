@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -517,6 +518,10 @@ func (d *DB) CopySyncStateFrom(sourcePath string) error {
 				return fmt.Errorf("copying %s: %w", tableCopy.table, err)
 			}
 		}
+	}
+
+	if err := copyAttachedArchiveStateTx(ctx, tx); err != nil {
+		return err
 	}
 
 	headRevisionExpr := "0"
@@ -1571,13 +1576,24 @@ func (d *DB) CopySessionMetadataFrom(
 				OR old_m.source_uuid = '')`
 		}
 		oldMVisible, oldYVisible, oldY2Visible := "", "", ""
-		if oldDBHasColumn(ctx, tx, "messages", "is_system") {
+		hasIsSystem := oldDBHasColumn(ctx, tx, "messages", "is_system")
+		if hasIsSystem {
 			oldMVisible = `
 			AND old_m.is_system = 0`
 			oldYVisible = `
 				AND y.is_system = 0`
 			oldY2Visible = `
 				AND y2.is_system = 0`
+		}
+		if hasSourceUUID && hasIsSystem {
+			if err := copyLegacyVSCodePinsTx(ctx, tx); err != nil {
+				return err
+			}
+			// These pins use the same conversion and fallback as local replacement.
+			legacyOnly += ` AND NOT EXISTS (
+                SELECT 1 FROM old_db.sessions old_s JOIN main.sessions new_s ON new_s.id = old_s.id
+                WHERE old_s.id = old_m.session_id AND old_s.agent IN ('vscode-copilot', 'positron')
+                  AND new_s.agent = old_s.agent)`
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO main.pinned_messages
@@ -2300,6 +2316,17 @@ func copySessionDataForIDs(
 			"JOIN "+tempIDsTable+" copied ON copied.source_id = old_s.id",
 	); err != nil {
 		return fmt.Errorf("copying sessions: %w", err)
+	}
+	if oldDBHasTable(ctx, tx, "archive_session_provenance") {
+		if err := copyAttachedArchiveStateTx(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO main.archive_session_provenance
+   (session_id,archive_id,device_id,root_id,source_key,manifest_id,native_session_id)
+   SELECT copied.id,p.archive_id,p.device_id,p.root_id,p.source_key,p.manifest_id,p.native_session_id
+   FROM old_db.archive_session_provenance p JOIN `+tempIDsTable+` copied ON copied.source_id=p.session_id`); err != nil {
+			return err
+		}
 	}
 	if oldDBHasTable(ctx, tx, "session_external_parents") {
 		if _, err := tx.ExecContext(ctx, `
@@ -3211,6 +3238,49 @@ func excludeLegacyCodexPagesByFileName(ctx context.Context, conn *sql.Conn) erro
 			p.id, p.createdAt,
 		); err != nil {
 			return fmt.Errorf("excluding legacy Codex page %s: %w", p.id, err)
+		}
+	}
+	return nil
+}
+
+// copyLegacyVSCodePinsTx restores UUID-less pins through the shared request
+// matcher before applying the ordinary legacy-content fallback.
+func copyLegacyVSCodePinsTx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT p.session_id
+  FROM old_db.pinned_messages p
+  JOIN old_db.messages m ON m.id = p.message_id
+  JOIN old_db.sessions old_s ON old_s.id = p.session_id
+  JOIN main.sessions new_s ON new_s.id = old_s.id AND new_s.agent = old_s.agent
+  WHERE old_s.agent IN ('vscode-copilot', 'positron') AND COALESCE(m.source_uuid, '') = ''`)
+	if err != nil {
+		return fmt.Errorf("listing legacy reply pin sessions: %w", err)
+	}
+	sessions, err := scanStrings(rows)
+	if err != nil {
+		return fmt.Errorf("scanning legacy reply pin sessions: %w", err)
+	}
+	for _, id := range sessions {
+		pins, err := savePinsFromSchemaTx(tx, "old_db", id, math.MinInt)
+		if err != nil {
+			return err
+		}
+		legacy := pins[:0]
+		for _, pin := range pins {
+			if pin.sourceUUID == "" {
+				legacy = append(legacy, pin)
+			}
+		}
+		old, err := loadLegacyVSCodeReplyAnchorsTx(tx, "old_db", id)
+		if err != nil {
+			return err
+		}
+		incoming, err := loadLegacyVSCodeReplyAnchorsTx(tx, "main", id)
+		if err != nil {
+			return err
+		}
+		identifyLegacyVSCodePins(legacy, MatchLegacyVSCodeReplyAnchors(old, incoming))
+		if err := restorePinsTx(tx, id, legacy); err != nil {
+			return err
 		}
 	}
 	return nil

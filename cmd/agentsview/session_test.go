@@ -1433,6 +1433,24 @@ func TestSessionExport_RejectsPGFlag(t *testing.T) {
 	assert.Contains(t, err.Error(), "--pg not supported")
 }
 
+func TestSessionUsage_MissingDiagnostic(t *testing.T) {
+	newAgentDataDir(t)
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/usage") {
+			http.NotFound(w, r)
+		} else {
+			writeJSONResponse(w, `{"id":"codex:missing","agent":"codex"}`)
+		}
+	})
+	cmd := sessionUsageCommand(t, "session", "usage", "codex:missing", "--server", ts.URL, "--own-only")
+	stderr := captureStderr(t, func() {
+		_, code, err := sessionUsageDataForCommand(cmd, "codex:missing")
+		require.NoError(t, err)
+		assert.Equal(t, tokenUseExitNotFound, code)
+	})
+	assert.Equal(t, "session not found: codex:missing\n", stderr)
+}
+
 func TestSessionUsage_ServerFlagUsesHTTP(t *testing.T) {
 	newAgentDataDir(t)
 
@@ -2064,7 +2082,7 @@ func TestSessionUsage_ServerTokenFileExpandsHome(t *testing.T) {
 
 func TestSessionUsage_ServerHTTPClientHasTimeout(t *testing.T) {
 	oldClient := sessionUsageHTTPClient
-	sessionUsageHTTPClient = &http.Client{Timeout: 20 * time.Millisecond}
+	sessionUsageHTTPClient = &http.Client{Timeout: 20 * time.Millisecond} //nolint:kennlint // deadlinetest: the held usage response ends only when the client deadline expires
 	t.Cleanup(func() { sessionUsageHTTPClient = oldClient })
 
 	newAgentDataDir(t)

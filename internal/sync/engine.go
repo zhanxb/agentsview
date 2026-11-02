@@ -448,7 +448,9 @@ type EngineConfig struct {
 	// before any content is published. False preserves source deletion policy.
 	// Used only by the local archive's scratch-database reparse.
 	ArchiveSessionPolicy func(context.Context, *db.Session, string) (bool, error)
-	// ParserExclusionPolicy validates exclusions before scratch rows are deleted.
+	// ArchiveWriteProvenance commits source ownership with normalized content.
+	ArchiveWriteProvenance func(*db.Session, string) (db.ArchiveSessionProvenance, error)
+	// ParserExclusionPolicy validates exclusions before any session metadata changes.
 	ParserExclusionPolicy func(context.Context, []string) error
 
 	AgentDirs      map[parser.AgentType][]string
@@ -556,6 +558,8 @@ type EngineConfig struct {
 	// stalled. Zero uses the production default. Tests and embedders may use a
 	// shorter interval without changing the daemon-wide policy.
 	ProgressStallAfter time.Duration
+	// RebuildSources prepares configured non-filesystem sources inside the rebuild lock.
+	RebuildSources func(context.Context) (RebuildOptions, error)
 	// ProviderFactories and ProviderMigrationModes select which concrete
 	// providers own discovery and parsing for their agents. Nil uses the
 	// parser package registry/manifest.
@@ -565,7 +569,8 @@ type EngineConfig struct {
 
 // Engine orchestrates session file discovery and sync.
 type Engine struct {
-	sourceSyncErr error
+	sourceSyncErr  error
+	rebuildSources func(context.Context) (RebuildOptions, error)
 
 	db    *db.DB
 	stat  func(string) (os.FileInfo, error)
@@ -661,6 +666,7 @@ type Engine struct {
 	disableProjectDiscovery bool
 	stableSourceSnapshots   bool
 	archiveSessionPolicy    func(context.Context, *db.Session, string) (bool, error)
+	archiveWriteProvenance  func(*db.Session, string) (db.ArchiveSessionProvenance, error)
 	parserExclusionPolicy   func(context.Context, []string) error
 	idPrefix                string
 	pathRewriter            func(string) string
@@ -1038,6 +1044,8 @@ func NewEngine(ctx context.Context,
 		stableSourceSnapshots:   cfg.StableSourceSnapshots,
 		idPrefix:                cfg.IDPrefix,
 		archiveSessionPolicy:    cfg.ArchiveSessionPolicy,
+		archiveWriteProvenance:  cfg.ArchiveWriteProvenance,
+		rebuildSources:          cfg.RebuildSources,
 		parserExclusionPolicy:   cfg.ParserExclusionPolicy,
 		pathRewriter:            cfg.PathRewriter,
 		storedPathResolver:      cfg.StoredPathResolver,
@@ -3197,6 +3205,14 @@ func (e *Engine) resyncBuildLocked(
 	ctx context.Context, onProgress ProgressFunc, opts RebuildOptions,
 	ops rebuildOperations, restoreActiveWriterOnAbort bool,
 ) (stats SyncStats, retErr error) {
+	if e.rebuildSources != nil {
+		sources, err := e.rebuildSources(ctx)
+		if err != nil {
+			return SyncStats{Aborted: true, Warnings: []string{err.Error()}}, err
+		}
+		opts.Contributors = append(opts.Contributors, sources.Contributors...)
+		opts.UnavailableContributorIDPrefixes = append(opts.UnavailableContributorIDPrefixes, sources.UnavailableContributorIDPrefixes...)
+	}
 	if e.sourceSyncErr != nil && (!errors.Is(e.sourceSyncErr, db.ErrArchiveOnly) || len(opts.Contributors) > 0) {
 		return SyncStats{Aborted: true}, e.sourceSyncErr
 	}
@@ -3249,6 +3265,11 @@ func (e *Engine) resyncBuildLocked(
 		log.Printf("resync: get old file count: %v", err)
 		oldFileSessions = 1
 	}
+	prefixes, err := origDB.AttachedArchiveIDPrefixes(ctx)
+	if err != nil {
+		return SyncStats{Aborted: true}, err
+	}
+	opts.UnavailableContributorIDPrefixes = append(opts.UnavailableContributorIDPrefixes, prefixes...)
 	localOldFileSessions := oldFileSessions
 	rebuildOldFileSessions := oldFileSessions
 	contributorOldFileSessions := make([]int, len(opts.Contributors))
@@ -3261,6 +3282,7 @@ func (e *Engine) resyncBuildLocked(
 			contributorPrefixes, len(opts.Contributors),
 		)
 		for _, contributor := range opts.Contributors {
+			contributorPrefixes = append(contributorPrefixes, contributor.IDPrefixes...)
 			if contributor.Config.IDPrefix != "" {
 				contributorPrefixes = append(
 					contributorPrefixes, contributor.Config.IDPrefix,
@@ -3296,6 +3318,16 @@ func (e *Engine) resyncBuildLocked(
 			localOldFileSessions = 1
 		}
 		for i, contributor := range opts.Contributors {
+			if contributor.ArchiveSources != nil {
+				for _, source := range contributor.ArchiveSources {
+					count, err := origDB.FileBackedSessionCountForArchiveSource(ctx, source)
+					if err != nil {
+						return SyncStats{Aborted: true}, err
+					}
+					contributorOldFileSessions[i] += count
+				}
+				continue
+			}
 			count, countErr := protectedFileSessionCount(ctx,
 				origDB, contributor.Config.Machine,
 				contributor.Config.IDPrefix,
@@ -3384,6 +3416,12 @@ func (e *Engine) resyncBuildLocked(
 		e.lastSyncStats = stats
 		e.mu.Unlock()
 		return
+	}
+	if err := newDB.CopyAttachedArchiveStateFrom(ctx, origPath); err != nil {
+		newDB.Close()
+		removeTempDB(tempPath)
+		restoreSkipCache()
+		return SyncStats{Aborted: true}, err
 	}
 
 	// 2b. Copy excluded session IDs from the old DB so that
@@ -3565,10 +3603,13 @@ func (e *Engine) resyncBuildLocked(
 			}
 			reportResyncProgress(p)
 		}
-		contributorStats := contributorEngine.syncAllLocked(
-			ctx, contributorProgress, time.Time{}, nil,
-			syncWriteBulk, true, contributor.ForceParse,
-		)
+		var contributorStats SyncStats
+		var contributorErr error
+		if contributor.Run != nil {
+			contributorStats, contributorErr = contributor.Run(ctx, contributorEngine, newDB, contributorProgress)
+		} else {
+			contributorStats = contributorEngine.syncAllLocked(ctx, contributorProgress, time.Time{}, nil, syncWriteBulk, true, contributor.ForceParse)
+		}
 		e.failures.Merge(&contributorEngine.failures)
 		contributorEngine.phaseStats.Log("resync contributor " + contributor.Name)
 		phase := phaseSnapshot(contributor.Name, &contributorEngine.phaseStats)
@@ -3602,9 +3643,9 @@ func (e *Engine) resyncBuildLocked(
 			}
 			return nil
 		}
-		if !contributorStats.ProcessingComplete() || stats.Aborted || ctx.Err() != nil ||
+		if contributorErr != nil || !contributorStats.ProcessingComplete() || stats.Aborted || ctx.Err() != nil ||
 			contributorSafetyAbort {
-			failureHookErr := runAfterFailure()
+			failureHookErr := errors.Join(contributorErr, runAfterFailure())
 			contributorEngine.Close()
 			if contributor.Finished != nil {
 				contributor.Finished(
@@ -10961,6 +11002,17 @@ func (e *Engine) collectAndBatchWithOptions(
 			r.releaseAll()
 			continue
 		}
+		completionCtx := ctx
+		if !e.discardWritesOnCancel {
+			completionCtx = context.WithoutCancel(ctx)
+		}
+		if err := e.validateSourceSessionOwnership(completionCtx, r.processResult); err != nil {
+			log.Printf("validate source session ownership: %v", err)
+			stats.RecordFailed()
+			e.noteSQLiteContainerResult(r.containerResultPath(), false)
+			r.releaseAll()
+			continue
+		}
 		sourceAllowsParserExclusions := e.sourceAllowsParserExclusions(
 			r.processResult,
 		)
@@ -10977,10 +11029,6 @@ func (e *Engine) collectAndBatchWithOptions(
 			resultIDs = append(resultIDs, result.Session.ID)
 		}
 		resultIDs = e.applyIDPrefixToSessionIDs(resultIDs)
-		completionCtx := ctx
-		if !e.discardWritesOnCancel {
-			completionCtx = context.WithoutCancel(ctx)
-		}
 		children, err := e.db.SubagentChildSessionIDs(completionCtx, append(
 			append([]string{}, excluded...), resultIDs...,
 		))
@@ -14424,11 +14472,6 @@ func (e *Engine) deleteParserExcludedSessions(ctx context.Context,
 
 	excluded := e.applyIDPrefixToSessionIDs(res.excludedSessionIDs)
 	if len(excluded) > 0 {
-		if e.parserExclusionPolicy != nil {
-			if err := e.parserExclusionPolicy(ctx, excluded); err != nil {
-				return nil, err
-			}
-		}
 		if _, err := e.db.DeleteParserExcludedSessions(ctx, excluded); err != nil {
 			return nil, err
 		}
@@ -18512,7 +18555,7 @@ func (e *Engine) writeBatchWithOutcomeContext(
 			// The staged sink owns this parse's tool-result rows, and only the
 			// staged write publishes them, so it runs even when signal
 			// recomputation is disabled.
-			werr = e.writeStagedFullParse(ctx, s, msgs, pw)
+			werr = e.writeStagedFullParse(ctx, s, msgs, pw, nil)
 		} else if replaceMessages && !e.disableSignalRecompute {
 			update, werr = e.attachFullSignalState(s, msgs, update, nil)
 			if werr != nil {
@@ -19113,6 +19156,7 @@ func stagedToolCallPositions(
 // commits with the content.
 func (e *Engine) writeStagedFullParse(
 	ctx context.Context, s db.Session, msgs []db.Message, pw pendingWrite,
+	write *db.SessionBatchWrite,
 ) error {
 	if pw.staged != nil {
 		if err := pw.staged.PublishToolResultImages(ctx); err != nil {
@@ -19147,11 +19191,15 @@ func (e *Engine) writeStagedFullParse(
 		log.Printf("checkpoint build %s: %v", pw.sess.File.Path, cpErr)
 		cp, blobs = nil, nil
 	}
-	if err := e.db.ReplaceSessionContentStagedWithCheckpoint(
-		ctx, s.ID, msgs, pw.staged,
-		e.blockedResultCategories, closure, cp, blobs,
-	); err != nil {
-		return err
+	var writeErr error
+	if write == nil {
+		writeErr = e.db.ReplaceSessionContentStagedWithCheckpoint(ctx, s.ID, msgs, pw.staged, e.blockedResultCategories, closure, cp, blobs)
+	} else {
+		write.Checkpoint, write.CheckpointBlobs = cp, blobs
+		writeErr = e.db.WriteSessionBatchStaged(ctx, *write, pw.staged, e.blockedResultCategories, closure)
+	}
+	if writeErr != nil {
+		return writeErr
 	}
 	e.anomalies.recordSanitize(pw.staged.ValidationStats())
 
@@ -19200,6 +19248,28 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 			continue
 		}
 		s, msgs := prepared.Session, prepared.Messages
+		provenance, err := e.sessionArchiveProvenance(&s, pw.sess.ID)
+		if err != nil {
+			outcome.err = err
+			outcome.failedSessions++
+			return outcome
+		}
+		if pw.staged != nil && provenance != nil {
+			err := e.writeAttachedStaged(ctx, prepared, pw, provenance)
+			if err != nil {
+				if isIntentionalSessionSkip(err) {
+					outcome.resolved[pendingIndex] = true
+					continue
+				}
+				outcome.err = errors.Join(outcome.err, err)
+				outcome.failedSessions++
+				continue
+			}
+			outcome.written[pendingIndex], outcome.resolved[pendingIndex] = true, true
+			outcome.writtenSessions++
+			outcome.writtenMessages += len(msgs)
+			continue
+		}
 		if pw.staged != nil {
 			// Staged streaming results bypass the bulk batch: their
 			// tool-result rows live in the staging scratch database and
@@ -19227,7 +19297,7 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 				continue
 			}
 			tWrite := time.Now()
-			err = e.writeStagedFullParse(ctx, s, msgs, pw)
+			err = e.writeStagedFullParse(ctx, s, msgs, pw, nil)
 			e.phaseStats.WriteNanos.Add(int64(time.Since(tWrite)))
 			if err != nil {
 				log.Printf(
@@ -19320,11 +19390,12 @@ func (e *Engine) writeBatchBulkWithOutcomeContext(
 			return outcome
 		}
 		writes = append(writes, db.SessionBatchWrite{
-			Session:          s,
-			Messages:         msgs,
-			UsageEvents:      prepared.UsageEvents,
-			PlanUsage:        prepared.PlanUsage,
-			ToolResultImages: &e.toolResultImages,
+			ArchiveProvenance: provenance,
+			Session:           s,
+			Messages:          msgs,
+			UsageEvents:       prepared.UsageEvents,
+			PlanUsage:         prepared.PlanUsage,
+			ToolResultImages:  &e.toolResultImages,
 			IdentityObservation: identityObservationOrZero(
 				identityObservation, hasIdentityObservation,
 			),
@@ -19879,6 +19950,9 @@ func shouldReplaceFullParseMessages(
 		// assistant tool-call message and attach result events to it. An
 		// append would leave the persisted tool call without those events.
 		pw.sess.Agent == parser.AgentCopilot ||
+		// VS Code-format replies grow at an existing message position.
+		pw.sess.Agent == parser.AgentVSCodeCopilot ||
+		pw.sess.Agent == parser.AgentPositron ||
 		isOpenCodeFormatStorageAgent(pw.sess.Agent) ||
 		pw.sess.Agent == parser.AgentVSCopilot ||
 		pw.sess.Agent == parser.AgentAntigravity ||
@@ -20295,7 +20369,7 @@ func (e *Engine) writeSessionFullWithResolver(
 	if pw.staged != nil {
 		// The staged sink owns this parse's tool-result rows, and only the
 		// staged write publishes them.
-		if err := e.writeStagedFullParse(ctx, s, msgs, pw); err != nil {
+		if err := e.writeStagedFullParse(ctx, s, msgs, pw, nil); err != nil {
 			log.Printf(
 				"write staged session %s: %v",
 				s.ID, err,
@@ -21270,6 +21344,9 @@ func (e *Engine) syncSingleSessionContext(ctx context.Context, sessionID string,
 	e.resetS3CodexIndexCache()
 	e.resetSourceClaims()
 
+	if strings.HasPrefix(e.db.GetSessionFilePath(ctx, sessionID), "archive://") {
+		return errors.New("reparse attached archive sessions with agentsview sync --full")
+	}
 	host, _ := parser.StripHostPrefix(sessionID)
 	if host != "" && !isS3SourcePath(e.db.GetSessionFilePath(ctx, sessionID)) {
 		return fmt.Errorf(
@@ -21483,6 +21560,9 @@ func (e *Engine) processAndWriteSessionFile(
 			e.cacheSkip(res.skipCacheKey(path), res.mtime, res.sourceFingerprint)
 		}
 		return false, sessionsChanged, res.err
+	}
+	if err := e.validateSourceSessionOwnership(ctx, res); err != nil {
+		return false, sessionsChanged, err
 	}
 	if res.sourceCwdResolution.State != parser.SourceCwdUnspecified {
 		changed, reconcileErr := e.reconcileFilteredSourceCwd(ctx,

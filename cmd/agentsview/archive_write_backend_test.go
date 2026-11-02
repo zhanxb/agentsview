@@ -24,6 +24,7 @@ import (
 	"go.kenn.io/agentsview/internal/storage"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
+	"go.kenn.io/kit/stacktest"
 )
 
 // TestDaemonPushHeartbeat pins the daemon-delegated push's client-side
@@ -995,7 +996,9 @@ func receiveArchiveTest[T any](t *testing.T, ch <-chan T) T {
 	select {
 	case value := <-ch:
 		return value
-	case <-time.After(time.Second):
+	// Full archive rebuilds include disk I/O; this only guards against hangs.
+	case <-time.After(30 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for archive watch result")
 		var zero T
 		return zero
@@ -1044,7 +1047,7 @@ func TestDaemonPGPushWatchSuppressesRepeatedOpenCodeSHMOnlyBatches(t *testing.T)
 		case reason := <-pushes:
 			require.Failf(t, "SHM-only batches must not schedule a push",
 				"received %q", reason)
-		case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; an SHM-only batch must never schedule a push
+		case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; an SHM-only batch must never schedule a push
 		}
 	}
 	pending, _ := pushLoopPendingState(loop)

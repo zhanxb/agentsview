@@ -22,6 +22,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 func testFSNotifyBackend(t *testing.T) *fsnotifyBackend {
@@ -932,6 +933,7 @@ func waitForBackendEvent(
 				return event
 			}
 		case <-deadline.C:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "backend event %v for %s was not observed", wantOp, path)
 		}
 	}
@@ -1095,7 +1097,7 @@ func TestFSNotifyBackendConcurrentAddWaitsForRemoveOwnershipDecision(t *testing.
 	select {
 	case <-barrier.addCalled:
 		addReachedWhileRemoveBlocked = true
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held Remove barrier keeps the native Add waiting
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the held Remove barrier keeps the native Add waiting
 	}
 	close(barrier.allowRemove)
 	require.NoError(t, <-removeErr)

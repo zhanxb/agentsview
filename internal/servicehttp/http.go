@@ -87,6 +87,7 @@ type httpBackend struct {
 	recallQueries     bool
 	// apiVersion is the probed server API version, or 0 when unknown.
 	apiVersion int
+	friction   bool
 	token      string
 }
 
@@ -98,6 +99,8 @@ type HTTPServerCapabilities struct {
 	ReadOnly           bool `json:"read_only"`
 	APIVersion         int  `json:"api_version"`
 	NonRecordingRecall bool
+	// FrictionReadable is set when the server's store serves friction reads.
+	FrictionReadable bool
 }
 
 // NewHTTPBackend constructs a SessionService that proxies to a
@@ -109,6 +112,7 @@ type HTTPServerCapabilities struct {
 // an empty value uses baseURL.
 func NewHTTPBackend(baseURL, token string, readOnly bool, browserURL string) service.SessionService {
 	b := newHTTPBackend(baseURL, token, readOnly, !readOnly)
+	b.friction = true
 	if browserURL != "" {
 		b.browserURL = browserURL
 	}
@@ -128,6 +132,7 @@ func NewHTTPBackendForServer(
 			capabilities.APIVersion >= recallNonRecordingAPIVersion,
 	)
 	b.apiVersion = capabilities.APIVersion
+	b.friction = capabilities.FrictionReadable
 	return b
 }
 
@@ -173,7 +178,7 @@ func probeHTTPServerCapabilities(ctx context.Context, api *apiclient.Client) (HT
 		return HTTPServerCapabilities{},
 			fmt.Errorf("probing server capabilities: %w", err)
 	}
-	return HTTPServerCapabilities{ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording"}, nil
+	return HTTPServerCapabilities{ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording", FrictionReadable: response.JSON200.FrictionReadable != nil && *response.JSON200.FrictionReadable}, nil
 }
 
 func (b *httpBackend) SupportsRecallQueries() bool { return b.recallQueries }

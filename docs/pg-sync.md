@@ -40,7 +40,14 @@ schema protections and grants but never runs hosted migrations.
 See [Hosted Raw Sync](/docs/hosted-raw-sync/#provision-a-hosted-instance) for
 the configuration, least-privilege grants and platform limits. Use `agentsview
 pg raw-reparse <runtime-target> --run-id <id> --batch-size 64` for bounded
-parser-version rollouts. To stop the worker, set `raw_derivation = false` and
+parser-version rollouts. Exhausted jobs can resume after a new source arrives,
+a processing-version selection changes, or an operator runs `agentsview pg
+raw-reparse <runtime-target> --repair --batch-size 64`. Repair uses this
+executable's processing version. It's safe to repeat until it prints
+`Rescheduled 0 failed jobs`, and leaves healthy jobs, in-progress jobs, and heads
+at other versions unchanged. Use `--repair` separately from `--run-id`.
+
+To stop the worker, set `raw_derivation = false` and
 keep `raw_tenant`, authentication and the cursor secret. This preserves hosted
 public reads and raw custody. It does not restore `pg push` access to the owned
 schema.
@@ -389,6 +396,12 @@ every configured target sequentially.
 
 Use the same `--projects`, `--exclude-projects`, or `--all-projects` filter
 flags as `pg push` to inspect the matching filtered or unfiltered watermark.
+
+With a `pg push --watch` watcher on this machine, status also shows its last
+success and any failure streak, and `--max-stale` alerts on a stalled watcher.
+Both work as described for
+[`clickhouse status`](/docs/clickhouse-sync/#agentsview-clickhouse-status); the
+record is `pg-watch-health.json`.
 
 Output:
 

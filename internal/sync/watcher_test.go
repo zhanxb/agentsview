@@ -18,6 +18,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 )
 
 const watcherTestTimeout = 5 * time.Second
@@ -28,6 +29,7 @@ func requireReceiveWithin[T any](t *testing.T, ch <-chan T, timeout time.Duratio
 	case value := <-ch:
 		return value
 	case <-time.After(timeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for channel value")
 		var zero T
 		return zero
@@ -78,7 +80,7 @@ func TestWatcherAcknowledgesLifecycleOnlyAfterSuccessfulReconciliation(t *testin
 	select {
 	case generation := <-gate.acknowledged:
 		require.Fail(t, "failed reconciliation acknowledged lifecycle", generation)
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the failed reconciliation must not acknowledge the lifecycle
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the failed reconciliation must not acknowledge the lifecycle
 	}
 	second := requireReceiveWithin(t, calls, time.Second)
 	assert.Equal(t, []string{"/sync"}, second.ReconcileRoots)
@@ -205,7 +207,7 @@ func TestWatcherLifecycleStoppedRejectsCollectionAndDispatch(t *testing.T) {
 	select {
 	case batch := <-calls:
 		require.Fail(t, "stopped watcher dispatched a batch", "%+v", batch)
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; a stopped watcher must never dispatch
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a stopped watcher must never dispatch
 	}
 }
 
@@ -320,6 +322,7 @@ func (b *fakeWatchBackend) sendBackendEvent(t *testing.T, event backendEvent) {
 	select {
 	case b.events <- event:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "scheduler did not drain backend event for %q", event.Path)
 	}
 }
@@ -329,6 +332,7 @@ func (b *fakeWatchBackend) sendError(t *testing.T, err error) {
 	select {
 	case b.errors <- err:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNowf(t, "test failed", "scheduler did not drain backend error %q", err)
 	}
 }
@@ -356,6 +360,7 @@ func startFakeWatcherWithLimits(
 	select {
 	case <-backend.started:
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "watch backend did not start")
 	}
 	return w
@@ -415,6 +420,7 @@ func receiveWatcherCall(t *testing.T, calls <-chan watcherCall) watcherCall {
 	case call := <-calls:
 		return call
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for watcher callback")
 		return watcherCall{}
 	}
@@ -431,6 +437,7 @@ func waitForPath(t *testing.T, calls <-chan []string, path string) {
 				return
 			}
 		case <-deadline.C:
+			stacktest.Dump(t)
 			require.FailNowf(t, "test failed", "timed out waiting for watcher path %q", path)
 		}
 	}
@@ -460,6 +467,7 @@ func receiveWatchBatch(t *testing.T, calls <-chan WatchBatch) WatchBatch {
 	case batch := <-calls:
 		return batch
 	case <-time.After(watcherTestTimeout):
+		stacktest.Dump(t)
 		require.FailNow(t, "timed out waiting for watcher callback")
 		return WatchBatch{}
 	}
@@ -2159,7 +2167,7 @@ func TestWatcherStopCancelsPendingCallback(t *testing.T) {
 	select {
 	case batch := <-calls:
 		require.FailNowf(t, "test failed", "callback ran after Stop with batch %+v", batch)
-	case <-time.After(350 * time.Millisecond): //nolint:kennlint // absence check; a stopped watcher must never run the callback
+	case <-time.After(350 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a stopped watcher must never run the callback
 	}
 }
 
@@ -2202,7 +2210,7 @@ func TestWatcherStopWaitsForRunningCallbackAndDiscardsPending(t *testing.T) {
 	select {
 	case <-stopped:
 		require.FailNow(t, "Stop returned before the running callback completed")
-	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the running callback keeps Stop waiting
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the running callback keeps Stop waiting
 	}
 
 	releaseCallback()
@@ -2440,7 +2448,7 @@ func TestWatcherIgnoresNonWriteCreate(t *testing.T) {
 	select {
 	case <-pathsCh:
 		require.FailNow(t, "onChange called for chmod event, expected it to be ignored")
-	case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; a chmod must never schedule a callback
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; a chmod must never schedule a callback
 		// Success
 	}
 }

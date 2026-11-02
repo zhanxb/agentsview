@@ -160,8 +160,10 @@
   "command_palette_search_error": "Search unavailable",
   "command_palette_search_failed": "Search failed. Please try again.",
   "command_palette_semantic_setup_title": "Semantic search isn't set up",
-  "command_palette_semantic_setup_config_step": "1. Add a [vector] section to config.toml, adjusting the model and endpoint for your embeddings server (any OpenAI-compatible endpoint works, e.g. Ollama):",
-  "command_palette_semantic_setup_build_step": "2. Restart the daemon, then build the index:",
+  "command_palette_semantic_setup_config_step": "1. Add this to config.toml:",
+  "command_palette_semantic_setup_local": "Already using Nomic with Ollama? Follow the full recipe to keep your index when switching to the shared local server.",
+  "command_palette_semantic_setup_local_link": "Server settings",
+  "command_palette_semantic_setup_build_step": "2. Restart the daemon, then build the index. The CLI asks before the first download:",
   "command_palette_semantic_copy_config": "Copy config snippet",
   "command_palette_semantic_copy_command": "Copy command",
   "command_palette_semantic_copied": "Copied!",
@@ -388,9 +390,23 @@
       }
     }
   ],
+  "tool_block_image_alt": "Image from tool output",
+  "tool_block_image_open": "Show image at full size",
+  "tool_block_image_close": "Close full-size image",
   "thinking_block_label": "Thinking",
   "compact_boundary_title": "Context window compacted at this point",
   "compact_boundary_label": "Context compacted",
+  "transcript_empty_messages": [
+    {
+      "declarations": ["input count", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{count} empty message",
+        "countPlural=other": "{count} empty messages"
+      }
+    }
+  ],
+  "transcript_empty_messages_title": "These messages have no text, thinking, or tool calls",
   "compact_boundary_show_full_summary": "Show full summary",
   "sidebar_session_count": [
     {
@@ -839,6 +855,10 @@
   "usage_tokens_attribution_title": "Token Attribution",
   "usage_attribution_treemap": "Treemap",
   "usage_attribution_list": "List",
+  "usage_label_scale_title": "Label size scale",
+  "usage_label_scale_linear": "Linear",
+  "usage_label_scale_sqrt": "Sqrt",
+  "usage_label_scale_log": "Log",
   "usage_chart_style": "Chart style",
   "usage_chart_style_smooth": "Smooth",
   "usage_chart_style_lines": "Lines",
@@ -1725,6 +1745,14 @@
   "insights_page_template_tool_reliability": "Tool Reliability",
   "insights_page_template_model_cost": "Model and Cost",
   "insights_page_template_instruction_opportunities": "Instruction Opportunities",
+  "insights_page_template_friction_review": "Friction Review",
+  "friction_review_summary_title": "Model-written summary",
+  "friction_review_summary_notice": "Written by a model from this digest's summary and pattern titles. It does not change findings, digests, or issues.",
+  "friction_review_summary_empty": "No summary for this digest yet.",
+  "friction_review_summary_generate": "Generate summary",
+  "friction_review_summary_regenerate": "Regenerate",
+  "friction_review_summary_generating": "Generating: {phase}",
+  "friction_review_summary_unavailable": "Summary generation is not available for this archive.",
   "insights_page_scope_no_automated": "No automated",
   "insights_page_scope_both": "Both",
   "insights_page_scope_only_automated": "Only automated",
@@ -2902,26 +2930,6 @@
       }
     }
   ],
-  "usage_plan_only_sessions": [
-    {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
-      "match": {
-        "countPlural=one": "{countLabel} session billed as plan usage, not priced",
-        "countPlural=other": "{countLabel} sessions billed as plan usage, not priced"
-      }
-    }
-  ],
-  "usage_partly_captured_sessions": [
-    {
-      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
-      "selectors": ["countPlural"],
-      "match": {
-        "countPlural=one": "{countLabel} session partly captured; its token counts are low.",
-        "countPlural=other": "{countLabel} sessions partly captured; their token counts are low."
-      }
-    }
-  ],
   "status_bar_codex_cloud_waiting": "Codex Cloud: waiting for first sync",
   "status_bar_codex_cloud_importing_found": [
     {
@@ -2979,5 +2987,170 @@
   "appearance_message_colors_swatch_gray": "Gray",
   "appearance_message_colors_preview": "Preview",
   "appearance_message_colors_preview_user": "Why does the date test fail?",
-  "appearance_message_colors_preview_assistant": "The fixture expects UTC. I updated it."
+  "appearance_message_colors_preview_assistant": "The fixture expects UTC. I updated it.",
+  "nav_friction": "Friction Log",
+  "friction_page_help_docs": "How the Friction Log works",
+  "friction_page_refresh": "Refresh Friction Log",
+  "friction_date_label": "Digest date",
+  "friction_date_previous": "Previous digest",
+  "friction_date_next": "Next digest",
+  "friction_date_no_match": "No matching dates",
+  "friction_build_now": "Build now",
+  "friction_build_title": "Build a digest for every complete day that does not have one yet",
+  "friction_build_done": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Built {countNumber} digest",
+        "countPlural=other": "Built {countNumber} digests"
+      }
+    }
+  ],
+  "friction_build_nothing": "Every complete day already has a digest.",
+  "friction_build_failed": "Build failed: {error}",
+  "friction_empty_title": "No friction digests yet",
+  "friction_empty_hint": "A digest is built automatically once each local day is complete, and the hourly job catches up on any day that was missed. Use Build now to build missing days right away.",
+  "friction_empty_hint_remote": "A digest is built automatically once each local day is complete, and the hourly job catches up on any day that was missed. To build missing days right away, open this page on the machine that runs AgentsView, or turn on require_auth on the server.",
+  "friction_load_error": "Could not load the Friction Log",
+  "friction_retry": "Retry",
+  "friction_digest_heading": "Friction Log — {date}",
+  "friction_digest_built": "Built {when} ({timezone})",
+  "friction_p0_failed": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "failed in {countNumber} session",
+        "countPlural=other": "failed in {countNumber} sessions"
+      }
+    }
+  ],
+  "friction_clean_title": "No friction found",
+  "friction_clean_hint": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Nothing was flagged in the {countNumber} session scanned.",
+        "countPlural=other": "Nothing was flagged in the {countNumber} sessions scanned."
+      }
+    }
+  ],
+  "friction_clean_no_sessions": "No sessions were active on this day.",
+  "friction_deferral_said": "Put off work: “{phrase}”",
+  "friction_pattern_retry_loop": "Retry loop",
+  "friction_pattern_runaway_loop": "Runaway tool loop",
+  "friction_pattern_edit_churn": "Edit churn",
+  "friction_pattern_mid_task_compaction": "Compaction mid-task",
+  "friction_pattern_context_pressure": "Context pressure",
+  "friction_pattern_iteration_runaway": "Long run without user input",
+  "friction_digest_missing": "No digest exists for {date}.",
+  "friction_scanned": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session scanned",
+        "countPlural=other": "{countNumber} sessions scanned"
+      }
+    }
+  ],
+  "friction_headline_title": "Needs attention",
+  "friction_p0_title": "Tools failing across sessions",
+  "friction_patterns_new": "New patterns",
+  "friction_patterns_recurring": "Recurring patterns",
+  "friction_pattern_occurrences": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} occurrence",
+        "countPlural=other": "{countNumber} occurrences"
+      }
+    }
+  ],
+  "friction_pattern_sessions": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} session",
+        "countPlural=other": "{countNumber} sessions"
+      }
+    }
+  ],
+  "friction_pattern_first_seen": "First seen {date}",
+  "friction_section_corrections": "Corrections",
+  "friction_section_errors": "Errors",
+  "friction_section_workarounds": "Workarounds",
+  "friction_section_deferrals": "Deferrals",
+  "friction_section_patterns": "Patterns",
+  "friction_section_frustration": "Frustration",
+  "friction_section_interruptions": "Interruptions",
+  "friction_interruption_count": [
+    {
+      "declarations": [
+        "input count",
+        "local countPlural = count: plural",
+        "local countNumber = count: number"
+      ],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countNumber} interruption",
+        "countPlural=other": "{countNumber} interruptions"
+      }
+    }
+  ],
+  "friction_kind_correction": "Correction",
+  "friction_kind_error": "Error",
+  "friction_kind_workaround": "Workaround",
+  "friction_kind_deferral": "Deferral",
+  "friction_kind_pattern": "Pattern",
+  "friction_kind_frustration": "Frustration",
+  "friction_kind_interruption": "Interruption",
+  "friction_disabled_title": "Friction Log is off on this server",
+  "friction_disabled_hint": "This server does not build digests. Set [friction] enabled = true in config.toml and restart the daemon. A read-only archive cannot build digests.",
+  "friction_markdown_title": "Markdown",
+  "friction_markdown_show": "Show Markdown",
+  "friction_markdown_copy": "Copy Markdown",
+  "friction_markdown_copied": "Copied Markdown",
+  "friction_markdown_download": "Download Markdown",
+  "friction_markdown_loading": "Loading Markdown…",
+  "friction_markdown_error": "Could not load the Markdown digest.",
+  "friction_open_session": "Open {session} at message {ordinal}",
+  "friction_open_session_start": "Open {session}",
+  "friction_quality_card_title": "Friction Log",
+  "friction_quality_card_body": "Daily digests of corrections, tool errors, workarounds, deferrals and recurring patterns found in your sessions.",
+  "friction_quality_card_open": "Open the Friction Log",
+  "friction_session_title": "Friction findings",
+  "friction_session_loading": "Loading friction findings…",
+  "friction_session_error": "Friction findings are unavailable.",
+  "friction_session_empty": "No friction findings in this session.",
+  "friction_session_jump": "Message {ordinal}",
+  "friction_session_jump_title": "Jump to message {ordinal}"
 }

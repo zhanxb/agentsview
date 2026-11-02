@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-22
+last_edited: 2026-10-27
 title: CLI Reference
 description: All AgentsView commands, flags, and environment variables
 ---
@@ -1004,6 +1004,49 @@ valid response invalid does.
 
 ______________________________________________________________________
 
+### `agentsview agents`
+
+List every agent AgentsView can read, where it looks for each agent's
+sessions, and which session details each agent's parser extracts. Pass one or
+more agent types to show only those agents. The command does not need a running
+daemon, configuration, or database.
+
+```bash
+agentsview agents
+agentsview agents codex claude
+agentsview agents --json
+```
+
+```
+codex (Codex)
+  sessions: ~/.codex/sessions, ~/.codex/archived_sessions
+  override: CODEX_SESSIONS_DIR
+  reads: first_message, session_name, cwd, git_branch, relationships, subagents, thinking, tool_calls, tool_results, tool_result_events, per_message_token_usage, termination_status, model
+```
+
+The `sessions` line shows the default locations relative to your home
+directory. The `override` line names the environment variable that replaces
+them. Import-only agents show `imported with agentsview import` instead.
+
+The JSON contract has `schema_version` (currently `1`) and an `agents` array.
+Each agent has these fields:
+
+| Field           | Type    | Meaning                                                                           |
+| --------------- | ------- | --------------------------------------------------------------------------------- |
+| `type`          | string  | Agent type used by `--agent` filters and session IDs                              |
+| `display_name`  | string  | Human-readable agent name                                                         |
+| `import_only`   | boolean | Sessions arrive only through `agentsview import`                                  |
+| `file_based`    | boolean | Sessions are files rather than an application database                            |
+| `default_dirs`  | array   | Default session locations, relative to the home directory                         |
+| `data_dir_root` | string  | Location under the AgentsView data directory, for agents AgentsView stores itself |
+| `env_var`       | string  | Environment variable that overrides `default_dirs`                                |
+| `content`       | object  | Session detail name mapped to `supported`, `unsupported`, or `not_applicable`     |
+
+New content details may appear without a schema bump, so consumers should ignore
+names they do not recognize.
+
+______________________________________________________________________
+
 ### `agentsview usage daily`
 
 Report token usage and estimated cost aggregated by local-time day, scoped to
@@ -1283,12 +1326,13 @@ Show PostgreSQL sync status.
 agentsview pg status [target] [flags]
 ```
 
-| Flag                 | Default | Description                                                 |
-| -------------------- | ------- | ----------------------------------------------------------- |
-| `--all`              | `false` | Show status for every configured PostgreSQL target          |
-| `--projects`         |         | Comma-separated projects whose push status to show          |
-| `--exclude-projects` |         | Comma-separated excluded projects whose push status to show |
-| `--all-projects`     | `false` | Ignore configured project filters for this status           |
+| Flag                 | Default | Description                                                      |
+| -------------------- | ------- | ---------------------------------------------------------------- |
+| `--all`              | `false` | Show status for every configured PostgreSQL target               |
+| `--projects`         |         | Comma-separated projects whose push status to show               |
+| `--exclude-projects` |         | Comma-separated excluded projects whose push status to show      |
+| `--all-projects`     | `false` | Ignore configured project filters for this status                |
+| `--max-stale`        |         | Exit non-zero when the push watcher has stalled longer than this |
 
 ______________________________________________________________________
 
@@ -1522,6 +1566,9 @@ Collect read-only diagnostics for startup sync decisions. This command does not
 create or migrate config files; it loads the current config read-only, inspects
 the SQLite archive, checks configured agent roots, and prints recent
 sync-related `debug.log` lines.
+
+If startup has rotated the log, inspect `debug.log.1` in the data directory for
+the previous tail.
 
 ```bash
 agentsview doctor sync
@@ -1789,6 +1836,7 @@ agentsview session watch <id>            # NDJSON event stream
 agentsview session search <pattern>      # content search across sessions
 agentsview session usage <id>            # token usage and cost estimate
 agentsview session usage <id> --own-only # exclude subagent transcripts
+agentsview session usage-batch <id>...   # ordered usage results for several sessions
 agentsview session label <id> k=v ...    # add or remove labels
 agentsview session parent <id> <parent>  # record the launching session
 ```
@@ -1897,6 +1945,20 @@ When `--server <url>` targets an explicit daemon, provide remote credentials
 with `AGENTSVIEW_SERVER_TOKEN` or `--server-token-file <path>`. Recall never
 sends the local daemon token from `config.toml` to an explicitly supplied
 server.
+
+______________________________________________________________________
+
+### `agentsview kata status`
+
+Shows whether the configured Kata instance is reachable, compatible (API
+schema 0.21.0 or newer), authenticated, and has the configured project. With a
+running daemon it reports the daemon's view. When no daemon owns the data
+directory, it probes from the local config without starting one. An
+unreachable owner returns an error. `--format json` prints the status
+object; `--json` is an alias. `--format human` selects the default text output.
+`--server URL` asks an explicit AgentsView daemon; use
+`AGENTSVIEW_SERVER_TOKEN` or `--server-token-file PATH` for its credential. See
+[Kata](/docs/kata/).
 
 ______________________________________________________________________
 
@@ -2011,6 +2073,37 @@ failure to stderr and exits successfully so startup problems do not prevent the
 agent session from opening. `--plugin-root` also diagnoses standalone skill
 copies that would be loaded alongside the native package; it never changes
 those files.
+
+______________________________________________________________________
+
+### `agentsview friction`
+
+Build and read the [Friction Log](/docs/configuration/#friction-log). Review
+must be enabled with `[friction] enabled = true`.
+
+```bash
+agentsview friction run [--date YYYY-MM-DD] [--rebuild] [--dry-run] [--format human|json | --json]
+agentsview friction digest [--date D | --from D --to D] [--format md|json | --json]
+agentsview friction findings [--date D] [--kind K] [--session ID] [--limit N] [--cursor C] [--format table|json | --json]
+agentsview friction patterns [--kind K] [--since D] [--limit N] [--cursor C] [--format table|json | --json]
+```
+
+- `friction run` without flags builds every complete local day that has no
+  digest yet. `--date` builds one day, `--rebuild` rebuilds an existing day
+  while keeping the sessions it already covered, and `--dry-run` computes
+  without writing. It prints one summary line per day, or the summary JSON
+  with `--json`.
+- `friction digest` prints the latest digest as Markdown unless `--date` or a
+  range is given. `--format json` prints the stored summary JSON.
+- `friction findings` lists stored findings. `friction patterns` ranks
+  recurring patterns by occurrences. `--kind` accepts `correction`, `error`,
+  `workaround`, `deferral`, `pattern`, `frustration`, and `interruption`.
+
+Read commands use the running daemon (starting one when needed), an explicit
+`--server <url>`, or `--pg` for the configured PostgreSQL hub. Provide a
+`--server` token with `AGENTSVIEW_SERVER_TOKEN` or `--server-token-file <path>`.
+`friction run` uses the daemon when one is running and otherwise writes the
+local archive directly.
 
 ______________________________________________________________________
 

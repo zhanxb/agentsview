@@ -1,6 +1,7 @@
 name: CI
 
 env:
+  GOTRACEBACK: all
   # "|" falls back to direct on any proxy error (e.g. HTTP/2 INTERNAL_ERROR), not just 404/410.
   GOPROXY: "https://proxy.golang.org|direct"
   # Compile with module-relative source paths so identical source shares one
@@ -23,29 +24,68 @@ concurrency:
 permissions:
   contents: read
 
+# Timeout p99 measurements: https://github.com/kenn-io/agentsview/pull/2547
 jobs:
-  lint:
+  changes:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.linter == 'nilaway' && 30 || 10 }}
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      groups: ${{ steps.changes.outputs.groups }}
+      all: ${{ steps.changes.outputs.all }}
+    steps:
+      - uses: kenn-io/actions/changes@main
+        id: changes
+        with:
+          filters: |
+            go:
+              - '!{frontend/**,desktop/**,*.md,docs/{README,changelog,contributing}.md,docs/agents/**/*.md,docs/internal/**/!(session-format-sources).md,docs/website/**/*.md}'
+              - 'desktop/src-tauri/icons/**'
+              - 'desktop/scripts/prepare-sidecar.sh'
+            frontend:
+              - '!{*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,desktop/**}'
+            node:
+              - '!{cmd/**,internal/!(web)/**,testdata/**,plugins/**,support/**,*.go,*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,desktop/**}'
+              - 'internal/importer/claude_ai_requests.txt'
+            desktop:
+              - '!{cmd/**,internal/!(web)/**,testdata/**,plugins/**,support/**,*.go,*.md,docs/*.md,docs/agents/**/*.md,docs/internal/**/*.md,docs/website/**/*.md,frontend/**}'
+              - 'frontend/chrome-extension/claude_fetch.js'
+              - 'internal/importer/claude_ai_requests.txt'
+
+  lint:
+    env:
+      DOWNLOAD_RETRY: kit-retry 3 5
+    needs: changes
+    if: &go-lane ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'go')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
-        linter: [golangci, nilaway]
+        include:
+          - linter: golangci
+            timeout: 19
+          - linter: nilaway
+            timeout: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: lint-${{ matrix.linter }}
           extra-path: ~/.cache/golangci-lint
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Prepare SQLite header
         if: runner.os == 'Linux'
@@ -67,12 +107,16 @@ jobs:
 
       - name: Install lint tools
         run: |
-          make lint-tools
+          kit-retry 3 5 make lint-tools nilaway-golangci-build
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Go checkers
+        if: matrix.linter == 'golangci'
+        run: GOFLAGS="${GOFLAGS:+$GOFLAGS }-n" kit-retry 3 5 make lint-workflow-retries lint-config-check lint-sql
 
       - name: Run Go linters
         if: matrix.linter == 'golangci'
-        run: make lint-config-check lint-sql lint-golangci-ci
+        run: make lint-workflow-retries lint-config-check lint-sql lint-golangci-ci
 
       - name: Run NilAway
         if: matrix.linter == 'nilaway'
@@ -80,33 +124,43 @@ jobs:
 
       - name: Check Huma API contract
         if: matrix.linter == 'golangci'
-        run: go run go.kenn.io/kit/cmd/huma-check@e9840a327158da2559458186b253b0c15a5e2c2b -fix=false ./...
+        run: |
+          huma=go.kenn.io/kit/cmd/huma-check@e9840a327158da2559458186b253b0c15a5e2c2b
+          kit-retry 3 5 go run -n "$huma"
+          go run "$huma" -fix=false ./...
 
       - name: Save Go caches
-        uses: ./.github/actions/go-cache-save
+        uses: $/.github/actions/go-cache-save
 
   frontend:
+    env:
+      DOWNLOAD_RETRY: kit-retry 3 5
+    needs: changes
+    if: &frontend-lane ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'go') || contains(fromJSON(needs.changes.outputs.groups), 'frontend')) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "26.12.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Prepare SQLite header
         if: runner.os == 'Linux'
@@ -115,10 +169,10 @@ jobs:
           echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
 
       - name: Generate pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: kit-retry 3 5 npm ci
         working-directory: frontend
 
       - name: Format, lint, and type-check (fix formatting with npm run fmt)
@@ -144,20 +198,25 @@ jobs:
         working-directory: frontend
 
   frontend-node-26:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'node')) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 11
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: "26.12.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
+
       - name: Install frontend dependencies
-        run: npm ci
+        run: kit-retry 3 5 npm ci
         working-directory: frontend
 
       - name: Run frontend tests
@@ -167,25 +226,33 @@ jobs:
   docs:
     name: Docs and scripts
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DOWNLOAD_RETRY: kit-retry 3 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+      - uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.15"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e  # v10.3.2
+        uses: astral-sh/setup-uv@v10.3.2
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Install docs check tools
         run: |
           sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) -exec sed -i -E \
             -e 's|https?://(azure\.)?archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
             -e 's|http://security\.ubuntu\.com/ubuntu|https://security.ubuntu.com/ubuntu|g' {} +
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
+          kit-retry 3 5 sudo apt-get -o APT::Update::Error-Mode=any update
+          kit-retry 3 5 sudo apt-get install -y ripgrep
+
+      - name: Install documentation dependencies
+        run: kit-retry 3 5 uv sync --project docs --frozen
 
       - name: Run docs check
         run: make docs-check
@@ -193,14 +260,17 @@ jobs:
       - name: Run shell script tests
         run: |
           bash scripts/install_test.sh
-          bash scripts/retry_test.sh
           bash scripts/e2e-server_test.sh
           bash desktop/scripts/test-repair-appimage-diricon.sh
 
   test:
+    needs: changes
+    if: *go-lane
     name: Go ${{ matrix.testSet == 'lint' && 'Lint' || 'Test' }} (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
     env:
+      DOWNLOAD_RETRY: kit-retry 3 5
       MSYS2_PACKAGES: mingw-w64-x86_64-gcc ${{ matrix.testSet == 'lint' && 'make' || '' }}
     strategy:
       fail-fast: false
@@ -209,42 +279,51 @@ jobs:
           - os: ubuntu-latest
             name: ubuntu-latest, Sync
             package: ./internal/sync
+            timeout: 29
           - os: ubuntu-latest
             name: ubuntu-latest, DuckDB
             package: ./internal/duckdb
+            timeout: 28
           - os: ubuntu-latest
             name: ubuntu-latest, Other packages
             testSet: other
+            timeout: 32
           - os: ubuntu-latest
             name: ubuntu-latest, Eval ingest
             testSet: evalingest
+            timeout: 16
           - os: windows-latest
             name: windows-latest
+            timeout: 34
           - os: windows-latest
             name: windows-latest
             testSet: lint
+            timeout: 21
           - os: macos-latest
             name: macos-latest
+            timeout: 29
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       # Set cache paths before setup-go and the Go cache restore.
       - name: Prepare Windows Go paths
-        uses: ./.github/actions/windows-go-paths
+        uses: $/.github/actions/windows-go-paths
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         id: setup_go
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Prepare SQLite header
         if: runner.os == 'Linux'
@@ -256,7 +335,7 @@ jobs:
         if: runner.os == 'Windows'
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
@@ -265,7 +344,7 @@ jobs:
 
       - name: Setup MinGW (Windows, retry on transient failure)
         if: runner.os == 'Windows' && steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
@@ -273,7 +352,8 @@ jobs:
           path-type: inherit
 
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        shell: bash
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run Go tests (Linux, single package)
         if: runner.os == 'Linux' && matrix.package != ''
@@ -326,7 +406,7 @@ jobs:
 
       - name: Restore Windows linter cache
         if: runner.os == 'Windows' && matrix.testSet == 'lint'
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: lint-${{ runner.os }}-${{ runner.arch }}-${{ steps.windows_linter_version.outputs.version }}-${{ hashFiles('.custom-gcl.yml') }}-${{ steps.setup_go.outputs.go-version }}
           include-go-cache: "false"
@@ -343,8 +423,7 @@ jobs:
           export PATH="$linter_dir:$PATH"
           if [ -f "$linter_dir/custom-gcl.exe" ]; then exit 0; fi
           mkdir -p "$linter_dir"
-          bash scripts/retry.sh 3 5 make lint-tools
-          make nilaway-golangci-build
+          kit-retry 3 5 make lint-tools nilaway-golangci-build
           mv custom-gcl.exe "$linter_dir/custom-gcl.exe"
         env:
           CGO_ENABLED: "1"
@@ -366,7 +445,7 @@ jobs:
       - name: Save Windows linter cache
         if: ${{ !cancelled() && runner.os == 'Windows' && matrix.testSet == 'lint' && steps.prepare_windows_linter.outcome == 'success' }}
         continue-on-error: true
-        uses: ./.github/actions/go-cache-save
+        uses: $/.github/actions/go-cache-save
 
       - name: Run archive, CLI, signing, and volume identity tests (macOS)
         if: runner.os == 'macOS'
@@ -378,7 +457,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           go test -race -tags fts5 ./internal/volumeid ./internal/rawcapture ./internal/requestsign -count=1 -timeout=10m
-          make lint-tools nilaway-golangci-build
+          kit-retry 3 5 make lint-tools nilaway-golangci-build
           ./custom-gcl run ./internal/volumeid ./internal/rawcapture ./internal/requestsign
         env:
           CGO_ENABLED: "1"
@@ -389,12 +468,15 @@ jobs:
 
       - name: Save Go caches
         if: matrix.testSet != 'lint' && (runner.os != 'Linux' || matrix.testSet == 'other')
-        uses: ./.github/actions/go-cache-save
+        uses: $/.github/actions/go-cache-save
 
   # Isolated Windows suites share setup; each matrix entry gets its own runner.
   test-isolated-packages-windows:
+    needs: changes
+    if: *go-lane
     name: Go Test (windows-latest, ${{ matrix.name }})
     runs-on: windows-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -417,28 +499,28 @@ jobs:
             package: ./internal/sync
             skip: *sync-test-prefix
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Prepare Windows Go paths
-        uses: ./.github/actions/windows-go-paths
+        uses: $/.github/actions/windows-go-paths
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
 
       - name: Setup MinGW
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
@@ -447,15 +529,18 @@ jobs:
 
       - name: Setup MinGW (retry on transient failure)
         if: steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
           install: mingw-w64-x86_64-gcc
           path-type: inherit
 
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
+
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        shell: bash
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       # The Windows system tree and the runner's data volume have parent
       # permissions that capture deliberately rejects. Use a private directory
@@ -486,8 +571,18 @@ jobs:
         shell: pwsh
         run: Remove-Item -LiteralPath $env:AGENTSVIEW_CI_TEMP -Recurse -Force
 
+      - name: Upload ${{ matrix.name }} test events
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: go-test-events-windows-${{ matrix.name }}-attempt-${{ github.run_attempt }}
+          path: go-test-events.jsonl
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Summarize ${{ matrix.name }} test timing
         if: always()
+        timeout-minutes: 2
         shell: pwsh
         run: |
           $eventsPath = "go-test-events.jsonl"
@@ -577,42 +672,36 @@ jobs:
           $summary | Write-Output
           $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Upload ${{ matrix.name }} test events
-        if: failure()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
-        with:
-          name: go-test-events-windows-${{ matrix.name }}-attempt-${{ github.run_attempt }}
-          path: go-test-events.jsonl
-          if-no-files-found: warn
-          retention-days: 7
-
   # Keep the derived-mirror suite concurrent with the main Windows package set.
   test-duckdb-windows:
+    needs: changes
+    if: *go-lane
     name: Go Test (windows-latest, DuckDB)
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Prepare Windows Go paths
-        uses: ./.github/actions/windows-go-paths
+        uses: $/.github/actions/windows-go-paths
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
 
       - name: Setup MinGW
         id: setup_mingw
         continue-on-error: true
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
@@ -621,15 +710,18 @@ jobs:
 
       - name: Setup MinGW (retry on transient failure)
         if: steps.setup_mingw.outcome == 'failure'
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        uses: msys2/setup-msys2@v2.33.0
         with:
           msystem: MINGW64
           update: false
           install: mingw-w64-x86_64-gcc
           path-type: inherit
 
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
+
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        shell: bash
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run DuckDB tests
         run: go test -tags "fts5" ./internal/duckdb -count=1 -timeout=20m
@@ -637,8 +729,13 @@ jobs:
           CGO_ENABLED: "1"
 
   test-race:
+    env:
+      DOWNLOAD_RETRY: kit-retry 3 5
+    needs: changes
+    if: *go-lane
     name: Go Test (race detector, ${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -666,20 +763,22 @@ jobs:
             runner: ubuntu-latest
             testSet: other
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: race-linux
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Prepare SQLite header
         if: runner.os == 'Linux'
@@ -688,7 +787,7 @@ jobs:
           echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
 
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       # Keep exclusions aligned with the explicit race matrix packages.
       # DuckDB runs without -race in its Linux shard. Limit package fan-out
@@ -716,19 +815,22 @@ jobs:
 
       - name: Save Go caches
         if: matrix.testSet == 'other'
-        uses: ./.github/actions/go-cache-save
+        uses: $/.github/actions/go-cache-save
 
   # Owns Windows Rust test coverage for PR and main-push desktop artifacts.
   desktop-windows-unit:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.all == 'true' || contains(fromJSON(needs.changes.outputs.groups), 'desktop')) }}
     name: Desktop Unit Tests (Windows)
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2
+        uses: step-security/rust-cache@v2.9.2
         with:
           workspaces: desktop/src-tauri -> target
           # Pull requests restore main's build without saving their own copy.
@@ -744,26 +846,23 @@ jobs:
           New-Item -ItemType Directory -Force desktop/src-tauri/binaries | Out-Null
           New-Item -ItemType File -Force "desktop/src-tauri/binaries/agentsview-$hostTriple.exe" | Out-Null
 
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
+
       - name: Fetch Windows desktop Rust dependencies
-        shell: pwsh
-        run: |
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            cargo fetch --locked --manifest-path desktop/src-tauri/Cargo.toml
-            if ($LASTEXITCODE -eq 0) {
-              break
-            }
-            if ($attempt -eq 3) {
-              exit $LASTEXITCODE
-            }
-            Start-Sleep -Seconds (10 * $attempt)
-          }
+        shell: bash
+        run: kit-retry 3 10 cargo fetch --locked --manifest-path desktop/src-tauri/Cargo.toml
 
       - name: Run Windows desktop unit tests
         run: cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --lib
 
   integration:
+    env:
+      DOWNLOAD_RETRY: kit-retry 3 5
+    needs: changes
+    if: *go-lane
     name: Integration (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 32
     strategy:
       fail-fast: false
       matrix:
@@ -805,23 +904,25 @@ jobs:
           --health-timeout 5s
           --health-retries 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
 
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
+
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Run PostgreSQL integration tests
         run: make ${{ matrix.postgres-target }}
@@ -837,29 +938,39 @@ jobs:
           TEST_CLICKHOUSE_URL: clickhouse://localhost:19000/default
 
   e2e:
+    needs: changes
+    if: *frontend-lane
     name: e2e (${{ matrix.browser }})
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
     env:
       PW_TEST_CONNECT_WS_ENDPOINT: ws://127.0.0.1:3000/
+      DOWNLOAD_RETRY: kit-retry 3 5
     strategy:
       fail-fast: false
       matrix:
-        browser: [chromium, webkit]
+        include:
+          - browser: chromium
+            timeout: 42
+          - browser: webkit
+            timeout: 24
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Restore Go caches
-        uses: ./.github/actions/go-cache-restore
+        uses: $/.github/actions/go-cache-restore
         with:
           group: test-${{ runner.os }}-${{ runner.arch }}
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.47.3
 
       - name: Prepare SQLite header
         if: runner.os == 'Linux'
@@ -867,14 +978,14 @@ jobs:
           make sqlite-vec-header
           echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
-          node-version: "24.22.1"
+          node-version: "26.12.1"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install frontend dependencies
-        run: npm ci
+        run: kit-retry 3 5 npm ci
         working-directory: frontend
 
       - name: Build frontend
@@ -889,7 +1000,7 @@ jobs:
           cp -r frontend/dist internal/web/dist
 
       - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+        run: kit-retry 3 5 go run ./internal/pricing/cmd/litellm-snapshot -restore
 
       - name: Pre-build Go binaries
         run: |
@@ -906,7 +1017,7 @@ jobs:
         run: |
           version=$(node -p 'require("./node_modules/@playwright/test/package.json").version')
           image="mcr.microsoft.com/playwright:v$version-noble"
-          if ! docker pull "$image"; then
+          if ! kit-retry 3 5 docker pull "$image"; then
             echo "::error::Could not pull $image. Microsoft may not have published the image for this @playwright/test version yet."
             exit 1
           fi
@@ -915,6 +1026,7 @@ jobs:
             "$image" \
             node node_modules/@playwright/test/cli.js run-server \
             --port 3000 --host 127.0.0.1 --unsafe)
+          # workflowretry: allow Poll the local service for readiness.
           until curl -s http://127.0.0.1:3000/; do
             [ "$(docker inspect -f '{{.State.Running}}' "$cid")" = true ] || { docker logs "$cid"; exit 1; }
             sleep 1

@@ -27,11 +27,21 @@ AgentsView stores all persistent data under a single directory, defaulting to
 ├── config.toml.lock # Serializes concurrent config writers
 ├── db.write.lock    # Per-data-dir SQLite write-owner lock
 ├── debug.log        # Log of the server, sync, and other commands
+├── debug.log.1      # Previous oversized debug log
+├── debug.log.rotate.lock
 ├── run/             # Windows only: daemon runtime records and locks
 ├── serve.log        # Detached daemon output
 ├── tmp/             # Temporary files, only when the system temp directory is unusable
 └── uploads/         # Uploaded session files
 ```
+
+When a command opens `debug.log` larger than 10 MB, it saves the last 10 MB
+to `debug.log.1`, replacing the older backup, then clears the active log for
+new messages. The backup can begin partway through a line. The `serve` command
+captures startup messages immediately and waits until any incumbent daemon
+has stopped before rotating. Debug log writes share `debug.log.rotate.lock`
+and wait while rotation holds it exclusively. If the lock is busy or the
+backup fails, AgentsView keeps the active log intact.
 
 `usage-cache-v6-<id>.db` is a derived cache of usage aggregates, not user data.
 It is safe to delete when no AgentsView process is running; the next usage query
@@ -274,6 +284,7 @@ zoom_level = 120
 | `[recall.extract]`                  | Opt-in model-backed recall extraction; named endpoints in `[recall.extract.servers.<name>]`, prompt selection in `[recall.extract.prompts]`, request overrides in `[recall.extract.request]` — see [Recall](/docs/recall/#automatic-extraction)                                                                                                                                                                                                                                  |
 | `[insights]`                        | Optional generated-insights endpoint and model, plus `default_agent`, the agent CLI new reports start with; local loopback HTTP is allowed, remote plaintext requires `allow_http = true`, and endpoint failures do not retry through a CLI — see [Recall](/docs/recall/#current-surface)                                                                                                                                                                                          |
 | `[friction]`                        | Opt-in Friction Log review; set `enabled = true` to review changed sessions in the background after each sync — see [Friction Log](#friction-log) |
+| `[kata]`                            | Optional Kata issue-tracker connection; off by default; HTTPS needs `token_env` — see [Kata](/docs/kata/)                                         |
 | `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview sync` — see [CLI Reference](/docs/commands/#agentsview-sync)                                                                                                                                                                                                                                                                                                                                                                        |
 | `[[session_sources]]`               | Additional filesystem session roots with per-root machine keys — see [Filesystem Session Sync](/docs/filesystem-sync/)                                                                                                                                                                                                                                                                                                                                                           |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                                                                                                                                                                                                                                              |
@@ -1368,18 +1379,17 @@ update for it and saw it end on the same connection, or when a token update
 from a later turn covers it. Any other finished turn, such as a chat's last
 turn that ran while AgentsView was not connected, may be missing some or all of
 its tokens from the chat's counts. A session with such turns and with recorded
-token counts stays in the token and cost totals, which then say "N sessions
-partly captured; their token counts are low."
+token counts stays in the token and cost totals, which then run low for that
+session.
 
 A chat that AgentsView never listened in on, or listened in on without receiving
 a token update, has no token counts. For those, AgentsView asks OpenAI's usage
 report for the chat's share of your plan's weekly and five-hour limits, and the
 credits figure the report includes. That plan usage shows in the session
-details. Such sessions are left out of token and cost totals, and the totals say
-how many were left out ("N sessions billed as plan usage, not priced"). That
-count includes a chat AgentsView has not asked about yet, such as one waiting
-while plan usage is paused. Its session details say "Plan usage: not checked
-yet" until the first answer arrives.
+details. Such sessions are left out of token and cost totals; `agentsview usage`
+reports how many were left out. That count includes a chat AgentsView has not
+asked about yet, such as one waiting while plan usage is paused. Its session
+details say "Plan usage: not checked yet" until the first answer arrives.
 
 AgentsView asks for plan usage again after a failed request or an incomplete
 report, waiting longer each time, up to 6 hours between requests. It refreshes
@@ -1941,6 +1951,143 @@ aborts, AgentsView falls back to an incremental sync and leaves the
 data-version marker stale. The running daemon retries the rebuild after an hour,
 backing off to daily; a restart also retries.
 
+## History from a saved archive
+
+This feature is unreleased. It lets an ordinary AgentsView installation browse
+and search a retired machine's history alongside current local sessions. The
+original Claude and Codex files stay in their Docbank storage; you can attach a
+backup snapshot or an existing archive directory. Neither requires a permanent
+extracted transcript directory.
+
+Copy an AgentsView archive backup repository to a local disk or mounted share.
+Add its path and the exact snapshot ID from the backup report to `config.toml`:
+
+```toml
+[[archive_sources]]
+name = "retired-desktop"
+repository = "/mnt/archives/desktop/backup-repo"
+snapshot = "<snapshot ID>"
+```
+
+If you already have an archive directory, use `directory` instead of
+`repository` and `snapshot`:
+
+```toml
+[[archive_sources]]
+name = "saved-history"
+directory = "/mnt/archives/restored"
+machine_name = "Previous workstation" # Optional; defaults to the captured name.
+```
+
+The directory can be an original AgentsView archive, the output of
+`agentsview archive restore`, or a Docbank-restored vault that retains its
+`application/sessions.db`. A vault containing only blobs is insufficient: the
+application database records accepted sources and their machine identities.
+Stop the source archive's AgentsView or Docbank process before attaching it.
+The directory must be writable for Docbank's catalog, locks, and maintenance;
+it is held exclusively for each import pass. Opening it may apply Docbank
+catalog upgrades. AgentsView opens the source `sessions.db` read-only and writes
+parsed results to the receiving installation.
+
+Restart a running daemon after editing the file, then run `agentsview sync`. The
+first sync reads the supported sources and reports pending work, captured
+deletion rules, and supplemental files. Sessions retain the original machine's
+identity and label. `name` labels the configuration entry; changing it does not
+change session ownership.
+
+A daemon started with `--no-sync` still handles manual `agentsview sync` and
+`agentsview sync --full`; automatic ingestion stays disabled.
+
+Pushes to PostgreSQL, ClickHouse, and DuckDB also read pending attached history
+after successful local sync, including on a `--no-sync` daemon. A push watch
+that owns the local archive reads attachments at startup and on each periodic
+sync. Its `--full` option reparses available attachments.
+
+An unavailable attachment produces a warning during a push from a current SQLite
+archive. Stored history and new local sessions still reach the destination;
+unfinished attachment work is retried on a later sync. Changes committed before an
+attachment error also queue a push in watch mode.
+
+Use the optional `machine_name` to change the display name of a single-machine
+archive. Restart the daemon and sync to apply a name change; no reparse is
+needed. Omit it for an archive containing several machines, which retain their
+individual captured names. Removing it restores the captured name. The
+underlying installation IDs come from the archive automatically and stay
+unchanged when you rename or move it.
+
+Later syncs skip transcripts whose parser and content-policy versions are
+current. The snapshot stays fixed until you change the configuration. A later
+snapshot containing a different version of an already accepted source is a
+conflict; this feature does not advance captures or follow the newest backup.
+
+### Space, reconnecting, and reparsing
+
+A backup source temporarily copies the snapshot's application database to build
+a small source index on its first sync. A directory source reads acceptance
+records directly from its application database on each pass, without copying
+that database or its transcripts. Backup bootstrap reports the required bytes
+before copying and removes the database afterward. Each parse also needs
+temporary space for one source and its companion files, up to 16 GiB, plus parser
+staging. Parsed sessions and retained images occupy the receiving installation's
+normal database and assets directory.
+
+Disconnecting the archive leaves already indexed history browsable. Sync reports
+the unavailable source and retries on a later pass. When a source fails to copy
+or parse, the next scheduled sync tries it again. If that retry also fails,
+scheduled syncs and pushes wait an hour, doubling to a day, and report the
+recorded error meanwhile. A manual `agentsview sync` retries immediately;
+restarting the daemon clears the wait. To move the archive, change `repository`
+and restart the daemon. A copied repository with the same repository ID and
+pinned snapshot continues the same history. A different repository at that path
+is refused. For a directory source, update `directory`; the archive identity and
+accepted source records remain independent of its path.
+
+Parser upgrades reparse available sources. Use `agentsview sync --full` to
+request a full reparse; individual session refresh directs attached history to
+that command. Local ingestion runs first and gets a turn between archive
+sources. It can still wait for one large source's parse: 16 GiB is a size limit,
+not a time limit.
+
+During a full rebuild, the old database stays readable, but writes pause with a
+retryable HTTP 503. Available archives extend that pause. Offline or removed
+sources keep their indexed history and unfinished parser work. If a backup
+starts between sources, the rebuild waits with progress and resumes afterward;
+cancelling leaves the original database in place. Ordinary sync defers a busy
+repository to a later pass. A backup blocked by an active reader can itself fail
+after 60 seconds and need a retry.
+
+### What is included
+
+- Accepted Claude and Codex sources become browsable. Supplemental originals
+  from other providers remain in the repository but are not parsed by this
+  feature.
+- The receiver's content and image policies apply. Its stars, names, pins, and
+  deletions survive reparsing. Curation from the saved database is not merged.
+- Capture-time deletion rules are honored. Sessions deleted in the saved archive
+  *after* capture can reappear; those later deletions are not imported.
+- History already received through artifacts or HTTP/SSH sync can appear again
+  under a different identity. Matching native session IDs does not prove that
+  two machines hold the same history. Exact-ID ownership conflicts are refused.
+- Attachments belong in an ordinary installation, not an archive-only one. The
+  receiving machine's own identity and aliases cannot be attached as foreign
+  history. Credentials and telemetry identity are never adopted from the source.
+- Both storage forms use the same source identities, content policies and
+  parser. Directory sources can discover additional accepted sources on a later
+  pass; changing an already accepted source remains a conflict. Concurrent
+  access to a running vault, direct object-storage access, and archive
+  configuration in the UI are outside this delivery.
+
+### Which sync feature should I use?
+
+| Feature                                   | Purpose                                                                                                                                                        |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `archive_sources`                         | Read a backup snapshot or archive directory alongside local sessions, retaining its original machine attribution.                                                          |
+| `session_sources`                         | Scan original session files already accessible in folders or mounted shares.                                                                                   |
+| HTTP/SSH remote sync                      | Collect session files from another running machine.                                                                                                            |
+| Artifact exchange                         | Exchange parsed session data and curation between installations. Attached originals are not republished as local artifacts.                                    |
+| Hosted raw sync                           | Capture and publish provider files to a hosted service for server-side parsing. Attached archives do not become local capture roots.                           |
+| Archive capture, backup, restore, extract | Preserve originals and recovery state, recover a standalone archive, or export captured files. These commands are not required to browse an attached snapshot. |
+
 ## Sync Behavior
 
 AgentsView keeps the database in sync with session files through three
@@ -2077,9 +2224,26 @@ Digests keep Markdown, schema 1 summary JSON, frozen findings and usage,
 session membership, and pattern recurrence. SQLite keeps this state through a
 full resync when the archive retains transcript text. Usage-only SQLite archives
 do not build or update digests. PostgreSQL builds its own digests from pushed
-findings when its serving role can write the review tables. Read APIs and CLI
-commands arrive in a later slice; this change stores the digests but does not
-expose a digest page.
+findings when its serving role can write the review tables.
+
+Read digests, findings, and recurring patterns on the **Friction Log** page (`/friction`),
+with [`agentsview friction`](/docs/commands/#agentsview-friction), the
+`/api/v1/friction` routes, or the `get_friction_digest` and
+`list_friction_patterns` [MCP tools](/docs/mcp/). `agentsview friction run`
+builds missing days on demand. Findings are heuristics: check the session
+before acting on one.
+
+On the Friction Log page, **Generate summary** asks the configured `[insights]`
+endpoint or agent CLI for an optional model-written overview of one digest.
+Nothing generates summaries on a schedule. The model receives the digest counts,
+P0 alerts, and up to 20 pattern titles ranked by occurrences. Pattern titles can
+contain up to 80 characters of the text that triggered a correction, workaround,
+or deferral; frustration titles are withheld because they quote the user. The
+model does not receive finding text, evidence, or transcripts. The summary is
+labeled as model-written and cannot change findings, digests, or recurrence.
+Repeating a request returns the saved summary until the digest changes, and
+saved summaries also appear under **Recall → Generated insights** as **Friction
+Review**.
 
 Local days wait until their sessions have current findings; the wait does not
 expire. Other completed days can build while review catches up. PostgreSQL uses
@@ -2137,8 +2301,9 @@ Notes:
 ### macOS Protected Folders
 
 To label a session with its Git remote, worktree, and branch, AgentsView reads
-Git metadata from the session's recorded working directory. On macOS some
-locations are guarded by a privacy consent prompt, and reading inside one makes
+Git metadata from the session's recorded working directory. It also reads
+`SKILL.md` files referenced by recorded tool calls to infer skill names. On macOS,
+some locations are guarded by a privacy consent prompt, and reading inside one makes
 macOS attribute the request to the AgentsView app and ask the user for access.
 Because the first sync walks every session in the archive at once, this produced
 a burst of prompts at first launch for folders the user never pointed AgentsView
@@ -2165,7 +2330,11 @@ they carry no Git remote, worktree relationship, or branch, and their project
 name comes from the path rather than the enclosing Git repository. Sessions
 anywhere else are unaffected.
 
-If you keep code in one of these folders and want the Git detail, opt in:
+Skill files in these locations also keep path-derived names; AgentsView skips
+their frontmatter without reading the file, including through directory
+symlinks.
+
+If you keep code or skills in one of these folders and want their metadata, opt in:
 
 ```toml
 scan_protected_paths = true
@@ -2402,14 +2571,14 @@ generating; opening a cached insight does not count.
 Downloads and Gist publishes count export attempts, including attempts that
 fail. Markdown links count after the link is copied successfully.
 
-| Event               | Property     | Allowed values                                                                                                        |
-| ------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `search_run`        | `query_type` | `text`, `semantic`, `hybrid`                                                                                          |
-| `session_viewed`    | `agent`      | the session's agent type                                                                                              |
-| `export_run`        | `format`     | `html`, `insight_html`, `csv`, `markdown_link`, `gist`, `insight_gist`                                                |
-| `insight_generated` | `kind`       | `daily_activity`, `agent_analysis`, or a generated-insight template name                                              |
-| `analytics_viewed`  | `page`       | `usage`, `activity`, `trends`, `quality`                                                                              |
-| `screen_viewed`     | `screen`     | `sessions`, `usage`, `activity`, `trends`, `recall`, `quality`, `pinned`, `trash`, `recent-edits`, `data`, `settings` |
+| Event               | Property     | Allowed values                                                                                                                    |
+| ------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `search_run`        | `query_type` | `text`, `semantic`, `hybrid`                                                                                                      |
+| `session_viewed`    | `agent`      | the session's agent type                                                                                                          |
+| `export_run`        | `format`     | `html`, `insight_html`, `friction_markdown`, `csv`, `markdown_link`, `gist`, `insight_gist`                                       |
+| `insight_generated` | `kind`       | `daily_activity`, `agent_analysis`, or a generated-insight template name                                                          |
+| `analytics_viewed`  | `page`       | `usage`, `activity`, `trends`, `quality`                                                                                          |
+| `screen_viewed`     | `screen`     | `sessions`, `usage`, `activity`, `trends`, `recall`, `quality`, `pinned`, `trash`, `recent-edits`, `friction`, `data`, `settings` |
 
 Feature outcomes use fixed categories; unknown strings become `other`.
 

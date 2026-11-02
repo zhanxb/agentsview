@@ -899,6 +899,8 @@ substring (the default) and regex modes also walk `tool_calls.input_json`,
 (`--cursor` is rejected) — see [Semantic Search](/docs/semantic-search/) for
 setup, scoring, and limitations.
 
+On PostgreSQL, `--fts` matches each word or quoted phrase as a case-insensitive substring; a query that starts with a quote also honors `AND`, `OR`, `NOT`, and parentheses as SQLite does. `NEAR(...)` and prefix `*` are not supported there; `*` matches literally.
+
 Every match, in every mode, carries the conversation-unit citation described in
 [Hit shape](/docs/semantic-search/#hit-shape-ranges-and-anchors):
 `ordinal_range` — `[start, end]` of the conversation unit containing the match,
@@ -919,6 +921,47 @@ passed. The same masking applies to the HTTP endpoint when called from a remote
 origin — `reveal=true` is only honored on a localhost-bound daemon.
 
 ______________________________________________________________________
+
+### `agentsview session usage-batch`
+
+Read usage for several sessions in one CLI process. Local and PostgreSQL modes
+select the backend and open the archive or connection once. With `--server`,
+the command still makes requests for each ID. IDs resolve as they do for
+`session usage`, including short IDs. Repeated IDs produce repeated results in
+input order.
+
+```bash
+agentsview session usage-batch <id>... [--format json] [--own-only] [--no-sync]
+```
+
+The command accepts the same `--server`, `--server-token-file`, and `--pg`
+options as `session usage`. Descendant usage and source refresh follow the
+single-session command's rules below.
+
+JSON always contains a `results` array, even for one ID. Each entry has
+`requested_id`, `exit_code`, and `usage` when available. `usage` has the same
+shape as `session usage --json`. Per-session failures include `error` text;
+missing sessions have code 2, and sessions without token data, cost, or plan
+usage figures have code 3. Code 0 means token data, cost, or Codex Cloud plan
+usage figures are available. Other lookup errors have code 1. The command
+continues after a per-session failure.
+
+```json
+{
+  "results": [
+    {
+      "requested_id": "missing-session",
+      "exit_code": 2,
+      "error": "session not found: missing-session"
+    }
+  ]
+}
+```
+
+Human output labels each requested ID and its exit code before its usage or
+error. The process exits 0 after completing the results, including per-session
+failures. Backend setup or output failures exit 1. The existing
+`session usage <id>` output and process exit codes remain unchanged.
 
 ### `agentsview session usage`
 
@@ -1094,6 +1137,36 @@ When some contributing models are unpriced, the cost line reads
 ```http
 GET /api/v1/sessions/{id}/usage
 ```
+
+On `main` after v0.46.1, this endpoint accepts raw agent session IDs
+as well as canonical archive IDs. Exact matches take precedence. If an exact
+lookup misses or reports an ambiguous identity, an ID without a known agent
+prefix or `~` host namespace is matched literally against stored IDs ending in
+`:` or `~` followed by that ID. Trashed sessions do not count toward these
+matches.
+A unique match returns `200` with the canonical archive ID in `session_id`.
+This applies to plain requests and all `subagents`, `rollup`, and `breakdown`
+combinations.
+Explicit canonical IDs that are missing still return `404`.
+
+Multiple matches return `409` with `error.code = "ambiguous_session_id"`:
+
+```json
+{
+  "error": {
+    "code": "ambiguous_session_id",
+    "message": "multiple sessions match; retry with a canonical candidate ID",
+    "candidates": ["archive-a~codex:thread-id", "archive-b~codex:thread-id"]
+  }
+}
+```
+
+Retry with one of the canonical IDs in `error.candidates`. The list contains
+at most five candidates and may omit additional matches. No match returns the
+same `404` described below. Lookup failures return the same `500` as usage-query
+failures. This fallback is specific to the usage endpoint; other session routes
+keep their existing lookup behavior. The GET reads archived data without
+refreshing or syncing source files.
 
 The response uses the same JSON fields shown above and is available from both
 local SQLite-backed `agentsview serve` and read-only

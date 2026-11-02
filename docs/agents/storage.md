@@ -309,6 +309,49 @@ hash state can contain raw trailing transcript bytes. They retain staged parsing
 but publish projected messages and tool metadata without staged output. Late
 result updates use the same projection as newly inserted messages.
 
+## Attached archive source state
+
+Ordinary installations can read fixed Docbank backup snapshots through
+`internal/archivesource`. See the
+[configuration guide](../configuration.md#history-from-a-saved-archive) for the
+user contract and limits. Archive-only installations cannot attach sources.
+
+The compact index under `archive-sources/` is disposable. It contains accepted
+source metadata, not messages. Rebuild it from the verified saved application
+database. Do not migrate that saved database or adopt its runtime identity. Key
+a directory attachment by its archive ID, never by catalog bytes; a changed
+catalog re-registers sources under the same attachment and keeps completion.
+
+`archive_attachments` and `archive_attachment_sources` track membership and
+per-source completion targets. `archive_source_bindings` binds original
+archive/device/root/source identity to an immutable manifest.
+`archive_session_provenance` binds each namespaced session to that source.
+Publish provenance and content in the same ordinary or staged write transaction;
+ordinary ingestion must refuse IDs owned by an attached source. Completion
+follows successful parsing and scratch cleanup. Global parser markers do not
+clear unfinished attachment work.
+
+Validate ownership of kept and parser-excluded results, including ordinary
+remote imports, and run exclusion policies before staging freshness versions or
+changing session metadata. A collision in one DAG branch must leave all existing
+branches unchanged. Repeat ownership checks in content write and exclusion
+transactions.
+
+Restoring an attached session invalidates source completion in every matching
+attachment and updates pending counts in the restore transaction. The next drain
+reparses the restored row even if an upgrade completed while it was trashed.
+Restores take no sync lock, so they write a fresh completion marker, and a
+source completes only if the marker it read before parsing is unchanged.
+
+Rebuilds copy registrations and ownership bindings before parsing, and copy
+session provenance with retained rows. Available sources run as contributors
+against the replacement database. Initially offline or detached sources,
+including empty mount directories with no archive layout, retain their previous
+content and completion. Corrupt archives and missing pinned snapshots in
+available repositories fail preparation. After a contributor starts, a failed
+read discards the replacement; only repository-writer contention waits and
+retries. Keep explicit column lists when carrying these tables forward.
+
 ## Archive Content Policy
 
 `archive_content` (`internal/config.ArchiveContent`) narrows what the SQLite

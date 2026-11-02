@@ -24,11 +24,14 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
 	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/archivesource"
 	"go.kenn.io/agentsview/internal/codexcloud"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction/filing"
 	"go.kenn.io/agentsview/internal/friction/review"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/kata"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/rawsync"
@@ -51,15 +54,27 @@ type VersionInfo struct {
 	InsightGenerationAvailable bool   `json:"insight_generation_available"`
 	SessionStatsAvailable      bool   `json:"session_stats_available"`
 	FrictionAvailable          bool   `json:"friction_available"`
-	APIVersion                 int    `json:"api_version"`
-	DataVersion                int    `json:"data_version"`
+	// FrictionReadable reports that this store serves the Friction Log
+	// read routes; mirrors without friction tables omit it.
+	FrictionReadable bool `json:"friction_readable,omitempty"`
+	// FrictionBuildAllowed reports that this request may start a build:
+	// the server has a friction runner and accepts runs from this caller.
+	FrictionBuildAllowed bool `json:"friction_build_allowed"`
+	KataAvailable        bool `json:"kata_available"`
+	APIVersion           int  `json:"api_version"`
+	DataVersion          int  `json:"data_version"`
 }
 
 // APIVersion is shared by HTTP version reporting and local daemon discovery.
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
 const (
-	APIVersion = 12
+	APIVersion = 14
+	// KataAPIVersion is the first daemon API that serves /api/v1/kata/status.
+	KataAPIVersion = 14
+	// FrictionAPIVersion is the first daemon API that serves
+	// /api/v1/friction digests, findings, patterns and runs.
+	FrictionAPIVersion = 13
 	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
 	// watcher batches and their authoritative recovery scope on push requests.
 	ScopedWatchPushAPIVersion = 7
@@ -193,7 +208,9 @@ type Server struct {
 
 	// localSyncRunner, when set, backs the foreground local-sync HTTP handler
 	// with the worker-backed pass instead of running SyncThenRun in process.
-	localSyncRunner LocalSyncRunner
+	localSyncRunner        LocalSyncRunner
+	archiveSources         *archivesource.Manager
+	onDemandArchiveSources *archivesource.Manager
 
 	// localResyncRunner, when set, backs the foreground full-resync HTTP handler
 	// with the worker-backed build-and-swap instead of an in-process resync.
@@ -214,13 +231,16 @@ type Server struct {
 	artifactExchangeRunner ArtifactExchangeRunner
 	rawSyncTenant          string
 	frictionRunner         *review.Runner
-	rawSyncDeviceAuth      RawSyncDeviceAuth
-	rawSyncCustody         RawSyncCustody
-	rawSyncStatus          RawSyncStatusReader
-	codexCloudStatus       *codexcloud.StatusBoard
-	rawSyncSchemaOnly      bool
-	rawSyncUploads         RawSyncUploads
-	rawSyncJobHealth       RawSyncJobHealth
+	// kata is the optional Kata spoke connection; never nil after New.
+	kata              *kata.Conn
+	frictionExclusive func(func() error) error
+	rawSyncDeviceAuth RawSyncDeviceAuth
+	rawSyncCustody    RawSyncCustody
+	rawSyncStatus     RawSyncStatusReader
+	codexCloudStatus  *codexcloud.StatusBoard
+	rawSyncSchemaOnly bool
+	rawSyncUploads    RawSyncUploads
+	rawSyncJobHealth  RawSyncJobHealth
 
 	ensurePricing func(context.Context, *db.DB) error
 }
@@ -293,6 +313,22 @@ func New(
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.kata == nil {
+		// Only a local SQLite archive with no PG push target is its own hub.
+		// pg serve passes its own hub Conn; read-only replicas are not hubs.
+		_, local := database.(*db.DB)
+		hub := local && filing.EligibleHost(false, cfg.HasPGPushTarget())
+		s.kata = kata.NewConn(kata.ConfigFrom(cfg.Kata, hub))
+	}
+	eligibility := "disabled"
+	if kataCfg := s.kata.Config(); kataCfg.Enabled {
+		if kataCfg.Hub {
+			eligibility = "hub"
+		} else {
+			eligibility = "not_hub"
+		}
+	}
+	log.Printf("kata: hub eligibility %s", eligibility)
 	if s.version.APIVersion == 0 {
 		s.version.APIVersion = APIVersion
 	}
@@ -561,10 +597,12 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 }
 
 // WithFriction attaches the Friction Log review runner. A nil runner leaves
-// the feature unavailable.
-func WithFriction(runner *review.Runner) Option {
+// the feature unavailable. exclusive serializes on-demand runs with the
+// scheduled catch-up job; nil runs them directly.
+func WithFriction(runner *review.Runner, exclusive func(func() error) error) Option {
 	return func(s *Server) {
 		s.frictionRunner = runner
+		s.frictionExclusive = exclusive
 	}
 }
 
@@ -654,6 +692,12 @@ type LocalSyncRunner func(
 // default) keeps the in-process SyncThenRun path, which server tests rely on.
 func WithLocalSyncRunner(r LocalSyncRunner) Option {
 	return func(s *Server) { s.localSyncRunner = r }
+}
+
+// WithArchiveSources shares the daemon's attached-archive manager with manual
+// sync requests that include local sources.
+func WithArchiveSources(manager *archivesource.Manager) Option {
+	return func(s *Server) { s.archiveSources = manager }
 }
 
 // LocalResyncRunner runs the daemon's foreground full resync, streaming progress
@@ -1444,10 +1488,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	return srv.Serve(ln)
 }
 
-// Shutdown gracefully shuts down the HTTP server, then closes the
-// server-owned on-demand sync engine (if one was lazily created) so
-// its pending debounced signal recomputes flush while the DB is
-// still open. Injected engines are closed by their owner.
+// Shutdown gracefully shuts down the HTTP server, stops its on-demand archive
+// drain, then closes its on-demand engine so pending signal recomputes flush
+// while the DB is still open. Injected managers and engines keep their owner.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.httpSrv
@@ -1471,7 +1514,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	engine := s.onDemandEngine
 	s.onDemandEngine = nil
+	attachments := s.onDemandArchiveSources
+	s.onDemandArchiveSources = nil
 	s.mu.Unlock()
+	if attachments != nil {
+		attachments.Close()
+	}
 	if engine != nil {
 		engine.Close()
 	}

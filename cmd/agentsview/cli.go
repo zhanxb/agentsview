@@ -133,6 +133,8 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newMCPCommand())
 	root.AddCommand(newRecallCommand())
 	root.AddCommand(newInsightCommand())
+	root.AddCommand(newKataCommand())
+	root.AddCommand(newFrictionCommand())
 	root.AddCommand(newStatsCommand())
 	root.AddCommand(newParseDiffCommand())
 	root.AddCommand(newClassifierCommand())
@@ -142,6 +144,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newSigningCommand())
 	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newVersionCommand())
+	root.AddCommand(newAgentsCommand())
 	root.AddCommand(newOpenAPICommand())
 	root.AddCommand(newRemoteSyncCommand())
 

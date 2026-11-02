@@ -76,7 +76,7 @@ ensure-embed-dir:
 # Chained from pricing-snapshot so every Go-compiling target stages it
 # without lengthening each prerequisite list.
 sqlite-vec-header:
-	@go mod download github.com/mattn/go-sqlite3
+	@$(DOWNLOAD_RETRY) go mod download github.com/mattn/go-sqlite3
 	@mkdir -p $(SQLITE_INCLUDE_DIR)
 	@install -m 0644 \
 		"$$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" \
@@ -85,7 +85,7 @@ sqlite-vec-header:
 # Restore the generated LiteLLM fallback snapshot from its artifact branch.
 # Pinned ref, SHA256, and branch are compiled into the snapshot tool.
 pricing-snapshot: sqlite-vec-header
-	go run ./internal/pricing/cmd/litellm-snapshot -restore
+	$(DOWNLOAD_RETRY) go run ./internal/pricing/cmd/litellm-snapshot -restore
 
 # Build the binary (debug, with embedded pricing snapshot and frontend)
 build: pricing-snapshot frontend
@@ -164,7 +164,7 @@ install-cjk-fts: install simple-fts
 
 # Build frontend SPA and copy into embed directory
 frontend:
-	cd frontend && npm ci && npm run build
+	cd frontend && $(DOWNLOAD_RETRY) npm ci && npm run build
 	rm -rf internal/web/dist
 	cp -r frontend/dist internal/web/dist
 	printf '%s\n' \
@@ -443,9 +443,9 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 	@sleep 2
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./cmd/agentsview \
-		-run 'TestRawSync.*CleanUploads|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
+		-run 'TestRawSync.*CleanUploads|TestPGServeKataHubConnection|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
+	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
 
@@ -456,13 +456,15 @@ test-postgres-ci:
 
 test-postgres-raw-sync-ci: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./cmd/agentsview \
-		-run 'TestRawSync.*CleanUploads|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
+		-run 'TestRawSync.*CleanUploads|TestPGServeKataHubConnection|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
 
 test-postgres-core-ci:
 	$(MAKE) -j1 test-postgres-core-fast-ci test-postgres-core-heavy-ci
 
+# These packages drop schemas that can own database-wide extensions, so their
+# cleanup must finish before another package starts using the same database.
 test-postgres-core-fast-ci: pricing-snapshot ensure-embed-dir
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -skip '^$(POSTGRES_CORE_HEAVY_TEST)$$' -count=1 -timeout=20m
+	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -skip '^$(POSTGRES_CORE_HEAVY_TEST)$$' -count=1 -timeout=20m
 	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
 
 test-postgres-core-heavy-ci: pricing-snapshot ensure-embed-dir
@@ -553,7 +555,7 @@ lint-sql:
 	go run go.kenn.io/kit/cmd/kennlint@v0.34.1 sql internal/db/schema.sql
 
 lint-config-check:
-	go run go.kenn.io/kit/cmd/kennlint@v0.34.1 config -check
+	go run go.kenn.io/kit/cmd/kennlint@v0.47.2 config -check
 
 # Build a custom golangci-lint binary with the kit and NilAway module plugins.
 # Strip every repo-local Git env var (GIT_DIR, GIT_INDEX_FILE,
@@ -681,7 +683,7 @@ docs-assets-branch:
 	bash docs/assets/update-static-assets-branch.sh
 
 docs-generated-assets-branch:
-	bash docs/screenshots/update-generated-assets-branch.sh
+	bash docs/screenshots/update-generated-assets-branch.sh --source "$(CAPTURE_ASSETS)"
 
 docs-deploy-staging:
 	vercel deploy docs
@@ -774,3 +776,36 @@ help:
 	@echo "  release        - Release build for current platform"
 	@echo "  clean          - Remove build artifacts"
 	@echo "  install-hooks  - Install pre-commit and pre-push git hooks"
+
+# Workflow actions run at the commits in .github/workflows/actions.lock,
+# including actions that other actions call. The organization requires
+# SHA-pinned actions, and the lockfile is what satisfies that for nested refs.
+# The version comes from constraints.ghActionsLock in renovate.json.
+# Renovate uses the same version when it regenerates the lockfile after
+# bumping an action.
+GH_ACTIONS_LOCK_VERSION ?= $(shell sed -nE "s/^[[:space:]]*\"?ghActionsLock\"?:[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" renovate.json)
+
+.PHONY: gh-actions-lock-install actions-lock actions-lock-check-local actions-lock-check
+
+gh-actions-lock-install:
+	@test -n "$(GH_ACTIONS_LOCK_VERSION)" || { echo "constraints.ghActionsLock is missing from renovate.json" >&2; exit 1; }
+	@if [ "$$(gh actions-lock --version 2>/dev/null)" != "actions-lock version $(GH_ACTIONS_LOCK_VERSION)" ]; then \
+		gh extension remove actions-lock >/dev/null 2>&1 || true; \
+		gh extension install github/gh-actions-lock --pin $(GH_ACTIONS_LOCK_VERSION); \
+	fi
+
+# Lock every workflow action after adding or bumping a `uses:` line
+actions-lock: gh-actions-lock-install
+	gh actions-lock --no-interactive
+
+# Offline check that every workflow action has a lockfile entry
+actions-lock-check-local: gh-actions-lock-install
+	gh actions-lock --verify-local
+
+# Network check that the lockfile is complete and every locked commit is still valid
+actions-lock-check: gh-actions-lock-install
+	gh actions-lock --verify
+
+.PHONY: lint-workflow-retries
+lint-workflow-retries:
+	GOOS= GOARCH= go run go.kenn.io/kit/cmd/kennlint@v0.47.3 workflow-retries

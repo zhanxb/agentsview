@@ -209,7 +209,9 @@ describe("App Recall availability", () => {
       data_version: 1,
       session_stats_available: false,
       friction_available: false,
+      friction_build_allowed: false,
       insight_generation_available: false,
+      kata_available: false,
       version: "dev",
       commit: "unknown",
       build_date: "",
@@ -1339,6 +1341,23 @@ describe("findUserPromptOrdinal", () => {
         false,
       ),
     ).toBeUndefined();
+  });
+
+  it("stops on each empty prompt inside an empty group", () => {
+    const empty = (ordinal: number, role: Message["role"]) =>
+      ({ ordinal, role, is_system: false }) as Message;
+    const group = {
+      kind: "empty-group" as const,
+      ordinals: [2, 3, 4],
+      messages: [empty(2, "assistant"), empty(3, "user"), empty(4, "user")],
+      timestamp: "",
+    };
+    const withGroup = [message(1, "user"), group, message(5, "user")];
+    expect(findUserPromptOrdinal(withGroup, 1, 1, true)).toBe(3);
+    expect(findUserPromptOrdinal(withGroup, 3, 1, true)).toBe(4);
+    expect(findUserPromptOrdinal(withGroup, 4, 1, true)).toBe(5);
+    expect(findUserPromptOrdinal(withGroup, 5, -1, true)).toBe(4);
+    expect(findUserPromptOrdinal(withGroup, 2, -1, true)).toBe(1);
   });
 
   it("skips system boundaries with a user role", () => {
