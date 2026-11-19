@@ -294,6 +294,54 @@ git reset --hard <第 1 步记下的 SHA>                # 已提交但想重来
 
 > 上游发新 tag 了，按 FORK_SYNC.md 同步并打包，不用下载安装包。
 
+### 上游改了 helper 函数签名（2026-11-19 实际发生过）
+
+上游 v0.47.0 把 `ListOpenCodeSessionMeta(dbPath)` 改成了 `ListOpenCodeSessionMeta(ctx, dbPath)`。
+Kilo / MiMoCode / Icodemate 都跟着改了，只有 CodeFree-O 的包装函数
+`ListCodeFreeOSessionMeta` 漏改，导致 `internal/parser` 编译失败（表现为
+`not enough arguments in call to ListOpenCodeSessionMeta`）。
+
+修法照抄 `icodemate.go`：给包装函数加 `ctx context.Context` 参数并透传给上游函数，
+同时把 `codefreeo_test.go` 里的调用改成 `ListCodeFreeOSessionMeta(t.Context(), dbPath)`。
+**这类改动是合并后编译失败最常见的原因**——上游改 OpenCode 共享 helper 时不会顾及 fork，
+`fork-verify.sh` 的编译步骤会第一时间抓到。
+
+### CI 在 "Set up job" 阶段失败：actions.lock 验证不通过
+
+上游从 v0.47.0 起引入了 GitHub 的 action lockfile 机制（`.github/workflows/actions.lock`），
+每个 action 都锁定到具体 SHA。如果锁定 SHA 与浮动 ref（如 `dtolnay/rust-toolchain@stable`
+的 `stable` 分支）当前指向的不一致，**所有 job 会在 Set up job 阶段直接失败**，
+报错形如：
+
+```
+lockfile verification did not produce a result for this action.
+Lockfile pin b725eda... for `dtolnay/rust-toolchain` does not match ref `stable`.
+```
+
+原因通常是上游发版后 `stable` 分支又前进了，而 tag 里的 lockfile 没更新（上游后来在 main
+上把 `@stable` 改成了 `@master` 来规避）。修法：对照上游 main 的最新
+`.github/workflows/actions.lock`，把 workflow/action 里的引用与 lockfile 条目同步改成
+`@master` 和对应的新 SHA（可用 API 查 `commits/master` 验证 SHA 有效）。
+这次的修复提交是 `68f6dab0`。
+
+### 前端测试报 safe-delete / SAFE_DELETE_BULK_CONFIRM_REQUIRED
+
+Vitest 启动时会清理 `frontend/node_modules/.vite` 缓存目录，WorkBuddy 的安全策略把这种
+批量删除拦下来，报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED`。这不是代码问题。
+`fork-verify.sh` 已改用 `vitest run --no-cache` 绕过，不用手工处理。
+
+### 本机代理软件没启动时怎么推送
+
+仓库级 git 配置指向 `socks5://127.0.0.1:10808`。如果 v2rayN 之类没开，push 会报
+`Could not connect to server`。这时可以临时直连（不改配置）：
+
+```bash
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com.proxy GIT_CONFIG_VALUE_0= git push origin main
+```
+
+直连时通时断，失败就多试几次（v0.47.0 这次重试到第 4 轮才成功）。
+打包脚本同理：`PROXY=none ./scripts/fork-package.sh`。
+
 ---
 
 ## 8. 常见问题
