@@ -43,7 +43,7 @@ runs:
           desktop/package-lock.json
           frontend/package-lock.json
 
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: dtolnay/rust-toolchain@master
       id: rust-toolchain
       continue-on-error: true
 
@@ -54,7 +54,7 @@ runs:
 
     - name: Retry Rust setup
       if: steps.rust-toolchain.outcome == 'failure'
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
 
     - name: Cache Rust dependencies
       uses: step-security/rust-cache@v2.9.2
