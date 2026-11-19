@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-10-29
+last_edited: 2026-11-07
 ---
 
 # Session Format Source Inventory
@@ -155,6 +155,77 @@ evidence; they do not establish whether a tool helped the task.
 
 ## Claude Code (`claude`)
 
+- **Hook output (checked 2026-11-04):** The parser reads the `hook_success`
+  attachment shape reported in
+  [#2456](https://github.com/kenn-io/agentsview/issues/2456) with `content`, and
+  in two first-hand reports with `stdout` and `stderr`:
+  [claude-code#88086](https://github.com/anthropics/claude-code/issues/88086),
+  [claude-code#85951](https://github.com/anthropics/claude-code/issues/85951).
+  It accepts only a JSON object whose `type` is `attachment` and whose
+  `attachment.type` is `hook_success`, `hook_additional_context`, or
+  `hook_cancelled`, reads the optional `hookName`, `hookEvent`, `command`,
+  `toolUseID`, `content`, `stdout`, and `stderr` string members, and keeps each
+  channel's text as written. Null optional strings are treated as absent; other
+  non-string values reject the hook. For `hook_additional_context`, it joins the
+  `content` string array with newlines and skips empty output. Cancelled hooks
+  keep their metadata even without output. Typed `timedOut` and `timeoutMs`
+  fields distinguish timeouts from explicit cancellation. Hook error attachments
+  are still not imported. The parser also imports `system` records with subtype
+  `stop_hook_summary`, retaining `hookLabel` as the Hook event line,
+  `hookCount`, each `hookInfos` command and optional `promptText`, the
+  `hookAdditionalContext` string array joined with newlines, string elements of
+  `hookErrors`, `preventedContinuation`, `stopReason`, and `toolUseID` as
+  labeled body sections. Non-string error elements are skipped individually. A
+  summary needs errors, prompt text, additional context, a stop reason, or
+  `preventedContinuation: true` to become a card; commands alone add no card.
+  Claude Code 2.1.301's installed producer constructs this summary with `Lhs`,
+  including `hookLabel`; its `wno` schema defines each hook info's `command` and
+  optional `promptText` strings, and `Cno` validates `hookAdditionalContext` as
+  a string array. Its HTTP, MCP, and command cancellation constructors supply
+  boolean `timedOut` and numeric `timeoutMs`. These are installed producer
+  evidence, rather than a public persistence schema. The
+  [hooks documentation](https://code.claude.com/docs/en/hooks) defines the hook
+  protocol's stdout and stderr, not transcript persistence. Full and incremental
+  parsing emit system rows with a null dialogue field, like queued system rows
+  and compact boundaries, so content search can find hook text when system
+  messages are included in substring, regex, and full-text search. The plain
+  body separates hook name, hook event, command, tool-use id, content, stdout,
+  and stderr without trimming or interpreting their text. Native identity fields
+  are retained only when supplied. Claude Code 2.1.301's installed bundle routes
+  all seven `hook_success` constructors through `en`, whose attachment envelope
+  stamps hooks with `new Date().toISOString()`. Its other attachment
+  constructors also supply or preserve timestamps. The same bundle has eight
+  `hook_cancelled` constructors with `hookName`, `hookEvent`, and `toolUseID`.
+  Three also carry `command`; none require output text. The timestamp-free
+  example in the original report is explicitly synthetic. Each owner's
+  attachments sort stably by timestamp before merging, with undated attachments
+  last. File order can differ from timestamp order when a queued prompt is
+  persisted after a later hook. Incremental parsing falls back to a full parse
+  when any dated appended attachment precedes the stored tail's timestamp.
+  Timestamp ordering can place a hook after an assistant even when its source
+  bytes precede the response. A continuation of the same message ID uses a full
+  parse when stored hooks trail the last assistant, so suffix replacement cannot
+  discard those earlier attachments.
+  Runs with only trailing queued prompts keep the bounded suffix reparse. Hooks
+  follow their native parent into the main conversation or a fork, including
+  parents hidden by `isMeta` and attachment chains through skipped empty hooks,
+  cancelled hooks, and other attachment types. Hooks attached to discarded retry
+  branches are dropped. Unresolved parents and linear parsing use the original
+  conversation timeline, alongside queued prompts. Linear parsing skips parent
+  lookup because all hooks use that timeline. This parser stage uses existing
+  message fields. Deferred hook identities stay on stored rows but do not
+  advance the ordinary entry-chain resume cursor for any imported hook subtype.
+  In normal transcript mode, hook rows use a collapsed Hook output card and an
+  independent Hooks filter. Cancelled hooks have a Hook cancelled label. Focused
+  mode hides these rows without treating them as new prompts. The card preserves
+  escaped body text. Data version 167 reparses readable Claude, Cowork, Qoder,
+  and iCodeMate CLI sources in place. The upgrade preserves session and public
+  message identities, pins, notes, names, stars, and retained rows whose sources
+  are gone; archive-only archives retain their pending state without source
+  sync. DuckDB rebuilds the mirror when its source data version changes. The
+  messages API and DuckDB preserve the existing system/source fields and body.
+  PostgreSQL preserves source identity, the system flag, and dialogue projection
+  fields. ClickHouse runtime behavior remains unverified.
 - **Protected skill paths (2026-10-28):** Reverified against a local Claude
   transcript containing a `tool_use` block named `Read` with `input.file_path`
   pointing to a `SKILL.md` in Downloads. Shared local skill inference applies
@@ -187,8 +258,9 @@ evidence; they do not establish whether a tool helped the task.
   [#2400](https://github.com/kenn-io/agentsview/issues/2400), kept in
   `internal/parser/testdata/claude/channel_messages.jsonl`. Inbound channel
   questions are `user` entries with `isMeta: true` and `origin.kind: channel`.
-  They remain user turns; other `isMeta` entries stay hidden. Transcript text
-  retains the `<channel>` envelope, while session previews show its body.
+  They remain user turns. Peer-origin meta entries are system messages, and
+  other `isMeta` entries stay hidden. Transcript text retains the `<channel>`
+  envelope, while session previews show its body.
 
 - **Dialogue projection:** Reverified 2026-10-17 against the shared block parser
   and ingest fixtures. Text blocks retain literal thinking and tool markers;
@@ -315,13 +387,37 @@ fixtures retain this field; missing identities remain source-local.
   `promptSource:"system"` carrying a delivery notice. Native parsing
   classifies a prompt that starts with `<cross-session-message` as a system
   row with `source_subtype` `peer_message`, keeping the wrapper so the sender
-  stays visible; non-channel `isMeta` user records remain dropped. Task
-  notifications in the same release are `type:"user"` records with
-  `origin:{"kind":"task-notification"}` and a `<task-notification>` body,
-  which the existing `task_notification` rule already covers. Checked against a
-  local transcript corpus; the synthetic fixture
+  stays visible. That parser version dropped non-channel `isMeta` user
+  records. Task notifications in the same release are `type:"user"` records
+  with `origin:{"kind":"task-notification"}` and a `<task-notification>` body,
+  which the existing `task_notification` rule already covers. Checked against
+  a local transcript corpus; the synthetic fixture
   `internal/parser/testdata/claude/queued_peer_messages.jsonl` mirrors these
   shapes. Data version 126 reparses existing sessions once.
+
+- **Peer user records (2026-11-06):** The Claude Code 2.1.310 transcript excerpt
+  in [#2718](https://github.com/kenn-io/agentsview/issues/2718) contains
+  inbound `type:"user"` records with `isMeta:true`, `promptSource:"system"`,
+  `turnOrigin:"peer"`, and `origin.kind:"peer"`. Their content starts with
+  `Another Claude session sent a message:` before the cross-session wrapper.
+  This is a reported artifact, not a capture made for this change. Static
+  inspection of the installed 2.1.314 producer corroborates peer-origin queue
+  entries with `isMeta:true` and preservation of `origin` in user messages.
+  Its turn-origin classifier also maps channels and other origins to `peer`,
+  so `turnOrigin` alone does not identify a cross-session message. No live
+  delivery was run. Searches for
+  `"cross-session-message" repo:anthropics/claude-code` and
+  `"turnOrigin" repo:anthropics/claude-code` returned no code hits. The public
+  tree at `90380efca7f9d73e206fac453f841b6acd664f4d` does not expose the
+  persistence implementation. The evidence class remains `no-public-source`.
+  Agentsview retains peer-origin user records as system `peer_message` rows,
+  preserving their text and excluding them from human turn counts and
+  previews. Synthetic regressions in `internal/parser/claude_peer_test.go`
+  cover full and incremental parsing, content blocks, delivery notices, and
+  rewind identity. Data version 166 reparses Claude, Cowork, Qoder, and
+  iCodeMate sources in place. The archive regression checks that unchanged
+  sources recover the message without changing session identity. Deleted sources
+  cannot recover messages omitted by the previous parser.
 
 - **Evidence:** `no-public-source`.
 
@@ -635,6 +731,44 @@ fixtures retain this field; missing identities remain source-local.
 
 ## Codex (`codex`)
 
+- **Code-mode wait output (checked 2026-11-03):** A local rollout records `wait`
+  arguments with `cell_id`, `yield_time_ms`, and `max_tokens`. Its
+  `function_call_output.output` is an array of `input_text` blocks containing
+  completion timing and script output; running polls return plain text.
+  Agentsview treats `wait` calls with a non-empty `cell_id` and no `ids` or
+  `targets` arguments as code-mode polls and stores their output as normal
+  tool results. Subagent waits keep their existing `status` handling,
+  including empty timeout statuses. They add no result event when `status` is
+  absent. Synthetic coverage in `TestParseCodexSession_FunctionCalls` and
+  `TestCodexCodeModeWaitOutputUpgradeReparsesInPlace` verifies the result and
+  an in-place reparse for Codex at data version 164.
+
+- **Code-mode waits (checked 2026-11-03 at
+  `b34808060a51e98b8cb3dcf77824703757737cda`):** The pinned
+  [wait handler](https://github.com/openai/codex/blob/b34808060a51e98b8cb3dcf77824703757737cda/codex-rs/core/src/tools/code_mode/wait_handler.rs)
+  resumes an exec cell using a string `cell_id`. The pinned
+  [response schema](https://github.com/openai/codex/blob/b34808060a51e98b8cb3dcf77824703757737cda/codex-rs/protocol/src/models.rs)
+  stores function-call arguments as a JSON string. The
+  [output formatter](https://github.com/openai/codex/blob/b34808060a51e98b8cb3dcf77824703757737cda/codex-rs/core/src/tools/code_mode/output.rs)
+  emits text blocks with script status, wall time, and output. These polls
+  stay on the incremental parse path when they bind no agent IDs through `ids`
+  or `targets`. Subagent waits still require a full parse, including the empty
+  `status` object returned on timeout by the
+  [subagent wait handler](https://github.com/openai/codex/blob/b34808060a51e98b8cb3dcf77824703757737cda/codex-rs/core/src/tools/handlers/multi_agents/wait.rs).
+  Covered by `TestParseCodexSessionFrom_CodeModeWaitStaysIncremental` and
+  `TestParseCodexSessionFrom_WaitOutputRequiresFullParse`. TraeX and Augure
+  Code share this parser. Parsed content and cursor encoding are unchanged.
+
+- **Hosted capacity (reverified 2026-11-01):** The pinned
+  [message schema](https://github.com/openai/codex/blob/3535c22b43e5d7a67322f6e85b267ef65577c227/codex-rs/protocol/src/models.rs)
+  stores text strings in response items; the
+  [rollout policy](https://github.com/openai/codex/blob/3535c22b43e5d7a67322f6e85b267ef65577c227/codex-rs/rollout/src/policy.rs)
+  persists message items. `TestSandboxCodexOutcomesAboveFormerLimit` scales
+  this existing shape synthetically through native capture, materialization
+  and the isolated parser, with one large string and many smaller messages. It
+  verifies lossless outcomes above the former transport ceiling, not a
+  producer size limit or a new provider format.
+
 - **Generated images (checked 2026-10-29 at
   `3535c22b43e5d7a67322f6e85b267ef65577c227`):** The pinned
   [response schema](https://github.com/openai/codex/blob/3535c22b43e5d7a67322f6e85b267ef65577c227/codex-rs/protocol/src/models.rs)
@@ -677,6 +811,17 @@ fixtures retain this field; missing identities remain source-local.
   and review that loss when curating a screenshot generation. The corpus
   procedure does not change the parser or claim complete conversation
   retention.
+
+- **Repository attribution (checked 2026-10-28):** The pinned
+  [GitInfo schema](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/protocol/src/protocol.rs)
+  carries optional `repository_url` and `branch` fields in session metadata.
+  A working directory can name a temporary worktree while the recorded URL
+  still identifies its repository. The parser retains both values. SQLite
+  ingestion now uses the recorded URL to resolve an otherwise unidentified
+  checkout's effective project, without probing the source machine's paths.
+  `TestCodexRemoteWorktreeProjectSurvivesAppendAndRebuild` exercises sibling,
+  nested, managed, and scratch worktrees through import, append, and rebuild.
+  This is an archive attribution policy, not a provider format change.
 
 - **Dialogue classification (checked 2026-10-22):** The pinned
   [response schema](https://github.com/openai/codex/blob/c71297b9a9b3f7995445eff8d768837814ac06f8/codex-rs/protocol/src/models.rs#L31-L96)
@@ -723,7 +868,80 @@ fixtures retain this field; missing identities remain source-local.
   `TestParseCodexSessionForkLineage` and
   `TestCodexOrdinaryForkLinkSurvivesSyncAndUpgrade` cover the link and the
   upgrade, using the shape reported in
-  [issue #2468](https://github.com/kenn-io/agentsview/issues/2468).
+  [issue #2468](https://github.com/kenn-io/agentsview/issues/2468). Rechecked
+  the pinned fork writer and subagent snapshot path on 2026-11-05: copied
+  forks retain their inherited prefix. Synthetic fixtures reproduce frozen
+  appends and copied usage after PR #2698. Fork writes now commit replay
+  membership and message origins with the transcript. Available messages keep
+  updating when the parent is missing. Previously observed parent turns filter
+  replay; otherwise sync warns about possible inherited messages and withholds
+  unverified token usage. Parent recovery removes confirmed replay and
+  restores child usage. `TestRebuildMissingParentRemainsRetryableAcrossRestart`,
+  `TestMissingParentForkPreservesShortenedHistoryAcrossReopen`, and
+  `TestCodexForkProvenanceFailureRollsBackContent` cover delayed recovery,
+  permanently unresolved retries, real database reopen, source truncation,
+  retained tool results and usage, staged publication, and atomic rollback.
+  `TestMissingParentForkPreservesLegacySourceHistory` also retains history
+  stored under the pre-version-40 source identity. Follow-up synthetic
+  fixtures in `TestCodexForkReview*` verify content-checked occurrence
+  matching, shared TraeX record origins, idless child turns, restored result
+  events, category filtering, retained activity bounds and previews, usage
+  ownership and ordinals, and provenance after archive policy projection.
+  These shortened-source fixtures exercise AgentsView's preservation policy;
+  they do not establish that Codex rewrites a rollout in that shape.
+  `TestCodexForkRetainsSpawnLinkWithoutOutput` covers the spawn output's link
+  metadata without result events.
+  `TestCodexForkStagedRetryKeepsPayloadsInScratch` checks the staged retry's
+  bounded payload representation, including when the source shrinks below the
+  staging threshold. Result-order and summary-participation fixtures cover
+  restored prefixes and sanitized empty updates. The accounting fixtures
+  exercise independently imported usage accepted by
+  `ApplyArtifactImportedSession`; current native Codex rollouts still provide
+  message usage rather than these archive event rows.
+  `TestCodexForkRetainsSummaryWithoutOutput` covers summary-only archived output
+  and blocked length retention with the call present or absent.
+  `TestCodexForkArchivedIdlessAfterChildBoundary` and
+  `TestCodexForkArchivedPreTurnReplayRecovery` cover saved replay boundaries
+  and the resulting transcript and preview.
+  `TestCodexForkLegacyDuplicateUsageOwnership` seeds pre-provenance rows
+  through the real parser, row preparation, and archive writer. Identical
+  parent and child occurrences retain unknown usage until source evidence
+  identifies it; complete occurrence sets, distinct timestamps, and current
+  usage are controls. `TestCodexForkMessageFreeChildBoundary` distinguishes
+  the parser's correct boundary from reconciliation, with named-parent and
+  message-bearing controls. `TestCodexForkReorderedArchivedReplay` covers
+  child-only then replay-only snapshots.
+  `TestCodexForkMessageFreeBoundarySurvivesShortening` preserves that source
+  context through a shortened source and archive rebuild.
+  `TestCodexForkRestoredOrderKeepsUsage` exercises descending match indices in
+  unresolved and resolved writes. `TestCodexForkImportedResultOccurrences`
+  reaches nullable raw event metadata through `ApplyArtifactImportedSession`;
+  repeated blocked retries retain summary lengths, image projection preserves
+  unknown identities, and archived calls without IDs retain output. Native
+  digests remain a separate control in `TestCodexForkNativeResultIdentity`.
+  `TestCodexForkMatchedMessageKeepsSourceBoundary` covers a matching child
+  whose earlier message-free boundary disappears, followed by parent recovery.
+  `TestCodexForkMatchedContextSurvivesResolvedRefreshes` retains context-only
+  evidence through resolved refreshes before a delayed idless parent page.
+  `TestCodexForkReplayCannotClaimIdlessChild` distinguishes identical pre-turn
+  or idless parent replay and idless child messages through unresolved
+  shortened-source retries; their separate 40- and 5-token fixtures recover
+  only the child's five tokens. `TestCodexForkImportedMultiAgentSummaryLength`
+  preserves imported participant evidence through blocked retries, an orphan
+  archive copy, database reopen, a partial agent update, and parent recovery,
+  without changing raw NULL metadata. Reordered, length-only, and
+  participation-only artifact replacements clear saved contributor hints
+  atomically while preserving other fork provenance.
+  `TestCodexForkNativeResultIdentity` also verifies that archive copies retain
+  known raw metadata and deduplicate returning source events after a rebuild.
+  `TestCodexForkRebuildBeforeProvenanceSchema` covers older archives without
+  local fork provenance, orphan preservation, and delayed parent recovery.
+  `TestCodexForkIdlessResultSignalsKeepOccurrences` preserves distinct result
+  outcomes for calls without provider IDs.
+  `TestCodexForkImportedOrdinalUsageSurvivesResolvedShortening` retains a
+  message referenced by imported usage after resolved refreshes and source
+  shortening. These synthetic archive cases were rechecked on 2026-11-05 in
+  both publication paths; they do not describe additional producer fields.
 
 - **Compressed rollouts (checked 2026-10-16, source at commit
   `6b991972c5b539198dcea9bac4fc14e57559c3af`):** A background worker started
@@ -825,12 +1043,28 @@ fixtures retain this field; missing identities remain source-local.
   Standalone parses refresh the inventory on every lookup. Directory identity,
   modification time, and metadata change time refresh changed folders when
   pages appear or move, while file identity still validates cached turn IDs.
-  Reverified on 2026-10-11 with 10 and 1,000 unrelated files and dated
-  directories, page discovery across batches, and parent edits and removal
-  within a batch. On Windows, directory metadata comes from one open handle,
-  but both timestamps can remain unchanged after entries move or appear, as
-  observed in the Windows inventory test on 2026-10-10. Each cached directory
-  therefore owns a
+  Linux can retain both directory timestamps for changes within one kernel
+  clock tick
+  ([kernel timestamp documentation](https://docs.kernel.org/filesystems/multigrain-ts.html)).
+  Reverified the pinned archival producer and inventory regressions on
+  2026-11-01: Linux reads native directory-name notifications synchronously,
+  sharing one descriptor across the factory's cached roots. Only notified
+  directories refresh their filenames. Overflow rebuilds the notification
+  instance; notification read failures keep forks eligible for retry. If
+  notification initialization or registration fails, readable directories are
+  enumerated on every lookup and registration is retried later. Invalidation,
+  eviction and runtime cleanup release descriptors. Stable source snapshots
+  enumerate once per parse without notifications, including inside the
+  read-only hosted parser sandbox. Data version 162 reparses Codex, TraeX and
+  Augure Code sources in place to repair already-current forks that missed a
+  parent page. The persisted archive upgrade regression keeps child bytes and
+  their saved stat digest unchanged, and verifies repaired messages, stable
+  session and source identities, and retained answer pins. Reverified on
+  2026-10-11 with 10 and 1,000 unrelated files and dated directories, page
+  discovery across batches, and parent edits and removal within a batch. On
+  Windows, directory metadata comes from one open handle, but both timestamps
+  can remain unchanged after entries move or appear, as observed in the Windows
+  inventory test on 2026-10-10. Each cached directory therefore owns a
   [name-change notification](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstchangenotificationw).
   Long drive and UNC paths use extended Windows syntax because this API can
   retain the `MAX_PATH` limit even when Go's file APIs can read the directory.
@@ -856,17 +1090,18 @@ fixtures retain this field; missing identities remain source-local.
   eligible for retry, and raw capture rejects an incomplete parent inventory.
   Reverified cold and warm inventories through denied and restored directory
   access on 2026-10-09. If the original exists but an archived parent page is
-  missing, copied turns from that page can still be imported and counted
-  again; turn IDs are read from files, not retained in the archive. When
-  upgrading an archive older than data version 131, newly split pages inherit
-  the thread's permanent deletion or trash state. Permanent deletions and
-  trash retain their whole-thread scope, including pages whose files return at
-  another path after the upgrade. Restoring a thread or one of its pages
-  clears the inherited trash scope; purging the thread transfers it to
-  permanent exclusions. New deletions affect only the selected file. Pins
-  follow the page named by the old row's file. PostgreSQL also moves remote-only
-  pins and notes before replacing the thread's messages. When the original
-  rollout is absent, PostgreSQL retires its duplicate transcript and usage after
+  missing, copied turns from that page can still be imported and counted again
+  if those turns were never observed. Fork provenance now retains previously
+  observed parent turn IDs across source removal. When upgrading an archive
+  older than data version 131, newly split pages inherit the thread's
+  permanent deletion or trash state. Permanent deletions and trash retain
+  their whole-thread scope, including pages whose files return at another path
+  after the upgrade. Restoring a thread or one of its pages clears the
+  inherited trash scope; purging the thread transfers it to permanent
+  exclusions. New deletions affect only the selected file. Pins follow the
+  page named by the old row's file. PostgreSQL also moves remote-only pins and
+  notes before replacing the thread's messages. When the original rollout is
+  absent, PostgreSQL retires its duplicate transcript and usage after
   preserving page curation; an empty thread row retains any inherited trash
   scope. Empty thread rows preserve page curation across push batch
   boundaries, including when a local restore has already cleared their trash
@@ -1264,6 +1499,29 @@ fixtures retain this field; missing identities remain source-local.
   state, which can contain trailing source bytes. This is an Agentsview
   storage change; the pinned producer format is unchanged.
 
+- **Commit result evidence reverified 2026-11-02:** the pinned
+  [tool result formatter](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/core/src/tools/context.rs)
+  emits `session_id` beside `output` in code mode and
+  `Process running with session ID N` in text mode. A read-only archive query
+  confirmed code-mode JSON inside `input_text` blocks; that archive contained
+  only `Bash`, `bash`, and `exec` shell tool names. Native `write_stdin`
+  arguments keep `session_id` and `chars` separately from the tool name, as
+  verified against `codex/fc_stdin.jsonl` and the parser's function-call path.
+  `TestCommitLinksNativePollOwnership` writes both representations through the
+  public archive API and checks the originating commit call's location.
+  Reverified 2026-11-05 with `TestCommitLinksCodeModeWithoutExecutionID` and
+  `TestCommitLinksNativePollOwnership`: scripts with exactly one tool call and
+  a fixed command literal can link commits without an output process ID.
+  `TestCommitLinksCodeModeFixedCommand` covers command decoding, workdir,
+  loops, and subjects mentioning tool names. Call syntax determines the number
+  of tool calls; bare tool names in commit subjects don't count. Command
+  literals containing `${` produce no links. A single-call `write_stdin`
+  script can poll an earlier commit execution without an output process ID.
+  Scripts with several tool calls cannot start new commit links. Their polls
+  need output process IDs matching earlier commit calls. The reused-process-ID
+  case checks that a new native commit execution owns its repository and
+  prompt after a batch poll.
+
 - **Pending calls reverified 2026-09-07:** the pinned upstream
   [task abort path](https://github.com/openai/codex/blob/406dc9239492aff6d295cca5eebe2a548548d42f/codex-rs/core/src/tasks/mod.rs#L846-L915)
   cancels work, allows a short grace period, and emits `turn_aborted`; it
@@ -1376,6 +1634,50 @@ fixtures retain this field; missing identities remain source-local.
   unmarked-notification shape, so the archive curation user-row removal that
   covers Codex and TraeX also covers `augure-code`.
 
+## Open Interpreter (`open-interpreter`)
+
+- **Format:** Codex rollout JSONL under a dated `YYYY/MM/DD` tree at
+  `~/.openinterpreter/sessions`, plus the flat `archived_sessions` directory.
+  `INTERPRETER_HOME` replaces `~/.openinterpreter`; the fork deliberately
+  ignores `CODEX_HOME`. Records carry a top-level `ordinal`, and rollouts add
+  `world_state` snapshots, `event_msg:item_completed` items, and
+  `session_meta` fields such as `session_id`, `runtime_workspace_roots`, and
+  `history_mode: "paginated"`. The parser reads the same `session_meta`,
+  `turn_context`, `response_item`, and `event_msg` records as Codex and skips
+  the rest without counting them as malformed. A failed turn ends in
+  `task_complete` with an `error` object and no assistant message.
+- **Evidence:** `source`.
+- **Upstream:** Clone `https://github.com/openinterpreter/openinterpreter.git`
+  at `771f9ef1e8a04db21f3c0925aa6df24f32339916` (checked 2026-11-07). The
+  [home directory resolver](https://github.com/openinterpreter/openinterpreter/blob/771f9ef1e8a04db21f3c0925aa6df24f32339916/codex-rs/utils/home-dir/src/lib.rs#L25)
+  picks `INTERPRETER_HOME` or `~/.openinterpreter`, the
+  [rollout crate](https://github.com/openinterpreter/openinterpreter/blob/771f9ef1e8a04db21f3c0925aa6df24f32339916/codex-rs/rollout/src/lib.rs#L84)
+  names the `sessions` and `archived_sessions` subdirectories, the
+  [rollout line](https://github.com/openinterpreter/openinterpreter/blob/771f9ef1e8a04db21f3c0925aa6df24f32339916/codex-rs/history/src/lib.rs#L277)
+  adds the optional `ordinal`, and the
+  [rollout item enum](https://github.com/openinterpreter/openinterpreter/blob/771f9ef1e8a04db21f3c0925aa6df24f32339916/codex-rs/history/src/rollout_payload.rs#L48)
+  defines `world_state`. The
+  [product identity](https://github.com/openinterpreter/openinterpreter/blob/771f9ef1e8a04db21f3c0925aa6df24f32339916/codex-rs/product-info/src/lib.rs#L3)
+  names the `interpreter` command used for resume. A rollout from Open
+  Interpreter 0.0.59 attached to agentsview issue 2745 has
+  `originator: "codex-tui"` and the Codex record shapes.
+- **Usage and cost:** Each model response persists both a `token_count` event
+  and a `token_usage_record` with the same per-response usage. The parser
+  counts `token_count` alone, as for Codex, and skips `token_usage_record`,
+  which only TraeX reads because its rollouts lack `token_count`. Reading both
+  would add a response's usage once per tool call it issued. Open Interpreter
+  targets open models through third-party providers (the sample used
+  `glm-5.2`); slugs absent from the pricing catalog price as unpriced.
+- **Agentsview:** `internal/parser/openinterpreter.go` relabels the shared Codex
+  parser (`internal/parser/codex.go`, `internal/parser/codex_provider.go`)
+  onto the `open-interpreter:` ID namespace, and `parser.IsCodexFormatAgent`
+  gates the Codex-format branches in sync, archive rebuilds, and the
+  PostgreSQL mirror. The fork writes `session_index.jsonl`, but thread titles
+  from it are read for Codex only, so Open Interpreter sessions are titled by
+  their first prompt. S3 import and raw capture also stay Codex-only. Fixture:
+  `internal/parser/testdata/openinterpreter/rollout_session.jsonl`, covered by
+  `TestOpenInterpreterProviderParsesRollout`.
+
 ## Augure Desktop v3 (`augure-desktop`)
 
 - **Format:** Hermes Agent state.db schema at `~/.augure-desktop/state.db`
@@ -1439,12 +1741,31 @@ fixtures retain this field; missing identities remain source-local.
   and
   [parser](https://github.com/getagentseal/codeburn/blob/3472885629c41725b40c19c0780ecce148b067bf/src/providers/copilot.ts).
 
-- **Usage and cost:** Assistant messages can persist model identity and output
-  tokens. Shutdown metrics can persist input, output, cache-read, cache-write,
-  and reasoning totals. When both shutdown and store usage are absent,
-  Agentsview records only known per-message output tokens; it does not infer
-  input, cache, reasoning, or credit totals. Known-model tokens use catalog
-  estimates; the existing shutdown reported-cost treatment is unchanged.
+- **Usage and cost:** Per-call store rows take precedence over
+  `session.usage_record` receipts and replace all shutdown token rollups.
+  Shutdown token rows before the first usable receipt are summed, just as in
+  sessions without receipts. Shutdowns written after that receipt are
+  cumulative snapshots of what receipts already record, so their token rows
+  are dropped. See the published schema evidence below. Receipts preserve each
+  request's timestamp, input, output, cache-read, cache-write, and reasoning
+  tokens. Without per-call usage, shutdown metrics supply totals, then known
+  per-message output is the fallback. Known-model tokens use catalog
+  estimates. A usable receipt after the latest reported-cost shutdown clears
+  that stale cost only when receipts supply the per-call usage.
+
+- **Receipt schema:** Reverified 2026-10-31 against the published
+  [Copilot CLI 1.0.105 Linux x64 package](https://registry.npmjs.org/@github/copilot-linux-x64/-/copilot-linux-x64-1.0.105.tgz)
+  (SHA1 `43322d0817b8564afcfe00f3929c00b033bca116`). The embedded schema
+  describes `tokenDetails` and `totalNanoAiu` as "Session-wide accumulated"
+  and `accountingSnapshot` as "captured atomically with receipt watermarks".
+  It defines `session.usage_checkpoint` for "reconstructing aggregate
+  accounting on resume". It defines `session.usage_record` with
+  `data.usage.model` and token fields under `data.usage`: `inputTokens`,
+  `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, and
+  `reasoningTokens`. Fresh input subtracts cache reads and writes. Receipts
+  use request pricing and their event timestamp without a message ordinal.
+  Data version 163 reparses available Copilot CLI sources in place without
+  changing session or source identities.
 
 - **Agentsview:** `internal/parser/copilot.go` and
   `internal/parser/copilot_provider.go`. Reverified 2026-07-28 against local
@@ -1605,6 +1926,27 @@ fixtures retain this field; missing identities remain source-local.
   Gemini CLI discovery or parsing.
 
 ## Grok Build (`grok`)
+
+- **Account CSV export (observed 2026-11-06):** A user-supplied xAI unified
+  usage export has `Billing Item ID`, `Event Time`, `Product`,
+  `Charge Category`, `Usage Type`, `Principal Type`, `Principal ID`, `Usage`,
+  `Pricing Currency`, `Pricing Contracted`, `Model`, and `User Email` columns.
+  This is observed export evidence, separate from the native session format
+  below. Synthetic examples are tested in `internal/xaiusage/csv_test.go`.
+  `Usage` is a JSON object of string-valued integer counters. Observed names
+  include `Prompt text tokens`, `Cached prompt text tokens`,
+  `Completion text tokens`, and the hyphenated forms `prompt-text-tokens`,
+  `cached-prompt-text-tokens`, `completion-text-tokens`, and
+  `cache-write-text-tokens`. Missing counters mean zero. Account counters may
+  aggregate many requests and are preserved without the native request-level
+  plausibility cap. `Event Time` is RFC3339; `Pricing Contracted` is a decimal
+  USD amount, including authoritative zero for included usage. Products
+  observed are `grok-build`, `grok-bot`, and `cursor`. Grok models can be
+  blank. Billing IDs identify account events, with no native session or
+  request identity for cross-source reconciliation. Unknown per-request
+  context sizes keep cache savings estimates at base model rates.
+  `agentsview usage grok` imports these events without reconstructing
+  conversations or inferring models.
 
 - **Format:** Workspace-scoped session directories containing `summary.json`, a
   derived `chat_history.jsonl` model-message cache, and an authoritative
@@ -1795,6 +2137,12 @@ Normal sync tests use the captured beta database schema and check archived
 payloads, image keep/drop behavior, unchanged PDF/text files and references, and
 an unchanged second sync. Data version 108 makes existing imports eligible to
 recover omitted file payloads. This adds retention, not a PDF previewer.
+`TestRetainedToolResultFilesProducerFixture` uses `tool_files.json` to check
+PDF/text sizes and the text digest. Service and UI tests use separate inputs.
+Reverified the retained-file decoder on 2026-10-22 against the parser's
+unchanged `file.uri` retention. Constructed service and API regressions cover
+empty base64 bodies and MIME parameters before the base64 marker, asserting
+decoded-byte digests and visible file occurrences.
 
 **V2 projection check (2026-09-08):** Cloned upstream at
 `dff8fbc149fb7492e4f07b713ac31ea70d9a541c` and checked the
@@ -3118,18 +3466,18 @@ schemas keep their existing ordering behavior.
 
 - **Format:** Released session generations `0` through `4` are stored as JSONL
   under `<sessions-root>/<project>/<encoded-session-id>/`. Generation zero
-  uses the suffix-only `session.jsonl` (or the default checksummed multi-frame
-  zstd encoding at `session.jsonl.zstd`); generation `N > 0` carries a
-  lowercase numeric component at `session.vN.jsonl[.zstd]`. One session
-  directory can retain several immutable generations; the numerically newest
-  canonical generation is current. The immutable header records session
-  identity, cwd, creation time, seed lineage, delegation origin, and agent
-  preset. Event rows carry a contiguous `seq`. Generations 0 and 1 may encode
-  runs of assistant deltas with the `text-chunks`, `reasoning-chunks`, and
-  `tool-call-chunks` packed storage rows, and their `sourceEventSeqs` uses
-  non-negative safe integers and inclusive `[start, end]` ranges, mixed entry
-  by entry: `[[138, 144]]` represents seven sequences. This provenance
-  compression was introduced in upstream commit
+  uses the suffix-only `session.jsonl` (or the default multi-frame zstd
+  encoding at `session.jsonl.zstd`); generation `N > 0` carries a lowercase
+  numeric component at `session.vN.jsonl[.zstd]`. One session directory can
+  retain several immutable generations; the numerically newest canonical
+  generation is current. The immutable header records session identity, cwd,
+  creation time, seed lineage, delegation origin, and agent preset. Event rows
+  carry a contiguous `seq`. Generations 0 and 1 may encode runs of assistant
+  deltas with the `text-chunks`, `reasoning-chunks`, and `tool-call-chunks`
+  packed storage rows, and their `sourceEventSeqs` uses non-negative safe
+  integers and inclusive `[start, end]` ranges, mixed entry by entry:
+  `[[138, 144]]` represents seven sequences. This provenance compression was
+  introduced in upstream commit
   [df76bc6](https://github.com/deepseek-ai/deepseek-harness/commit/df76bc695b4bdff093369ab22a506cd37ca087c1).
   Generation 2 embeds the timed assistant stream in `assistant/message` and
   records settled non-surface attempts as `assistant/attempt`; generation 3
@@ -3211,6 +3559,15 @@ schemas keep their existing ordering behavior.
     They carry job identity, the creating tool call, timing, and the terminal
     status, but no model-visible output, so they are metadata. The tool output
     remains in the paired `tool/result`.
+
+    Physical framing was reverified 2026-11-02 at commit
+    `ce7073d51254c26cd63b22a60835b8f948deb447`. The
+    [frame writer](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/session/session-persistence-jsonl/src/zstd.ts#L18-L20)
+    requests a content checksum, but the
+    [frame scanner](https://github.com/deepseek-ai/deepseek-harness/blob/ce7073d51254c26cd63b22a60835b8f948deb447/packages/session/session-persistence-jsonl/src/zstd.ts#L69-L98)
+    reads the checksum flag frame by frame and accepts frames without one.
+    Users report v4 logs whose frames carry no checksum, so Agentsview also
+    treats the checksum as optional per frame.
 
 - **Usage and cost:** Each model response and summarizing compaction can persist
   disjoint input, output, cache-read, cache-write, and reasoning token counts.
@@ -3852,7 +4209,8 @@ schemas keep their existing ordering behavior.
   example was reverified on 2026-10-09. The `home scopes` subtest of
   `TestHermesCronStateGroups` verifies that rewritten Windows paths keep
   distinct homes separate by accepting both path separators. Names derive from
-  the recorded `session_name` at read time; usage-only archives show job IDs
+  the recorded `session_name`; the usage cache stores the derived label and
+  journals name changes on grouped runs. Usage-only archives show job IDs
   because their titles are discarded. Resync copies preserve stored job IDs,
   including imported sessions. Archived runs whose sources were gone before
   upgrading stay individual sessions unless they already have a stored job ID.
@@ -5275,7 +5633,9 @@ schemas keep their existing ordering behavior.
 - **Evidence:** `source`.
 - **Upstream:** Clone `https://github.com/vercel-labs/fx.git` at
   `b9ca60d0102cf84cea061456c41206f66149b311`. Reverified 2026-10-13. Fixtures
-  were captured with fx v0.0.13.
+  were captured with fx v0.0.13. Shell result `output_delta` reverified
+  2026-11-02 against
+  `internal/parser/testdata/fx/parent-session/events.jsonl`.
 - **Usage and cost:**
   [Session usage](https://github.com/vercel-labs/fx/blob/b9ca60d0102cf84cea061456c41206f66149b311/src/core/session/session_usage.zig)
   stores cumulative per-model totals in `usage-v2.json` under

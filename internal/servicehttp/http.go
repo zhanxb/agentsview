@@ -84,7 +84,9 @@ type httpBackend struct {
 	client            *http.Client
 	longRunningClient *http.Client
 	readOnly          bool
+	signed            bool
 	recallQueries     bool
+	docbankEnabled    bool
 	// apiVersion is the probed server API version, or 0 when unknown.
 	apiVersion int
 	friction   bool
@@ -101,6 +103,7 @@ type HTTPServerCapabilities struct {
 	NonRecordingRecall bool
 	// FrictionReadable is set when the server's store serves friction reads.
 	FrictionReadable bool
+	DocbankEnabled   bool `json:"docbank_enabled"`
 }
 
 // NewHTTPBackend constructs a SessionService that proxies to a
@@ -133,15 +136,15 @@ func NewHTTPBackendForServer(
 	)
 	b.apiVersion = capabilities.APIVersion
 	b.friction = capabilities.FrictionReadable
+	b.docbankEnabled = capabilities.DocbankEnabled
 	return b
 }
 
 func newHTTPBackend(
 	baseURL, token string, readOnly, recallQueries bool,
 ) *httpBackend {
-	browserURL := baseURL
-	if requestsign.SignsFromEnvironment(baseURL) {
-		// Signed machine listeners serve no browser UI, so omit session links.
+	signed, browserURL := requestsign.SignsFromEnvironment(baseURL), baseURL
+	if signed {
 		browserURL = ""
 	}
 	return &httpBackend{
@@ -150,10 +153,13 @@ func newHTTPBackend(
 		client:            &http.Client{Timeout: 30 * time.Second},
 		longRunningClient: &http.Client{Timeout: 0},
 		readOnly:          readOnly,
+		signed:            signed,
 		recallQueries:     recallQueries,
 		token:             token,
 	}
 }
+
+func (b *httpBackend) SupportsFileReferences() bool { return !b.signed && b.docbankEnabled }
 
 // ProbeHTTPServerCapabilities reads the metadata needed to expose tools safely
 // for an explicit daemon URL. Such callers do not have a local runtime record.
@@ -178,7 +184,7 @@ func probeHTTPServerCapabilities(ctx context.Context, api *apiclient.Client) (HT
 		return HTTPServerCapabilities{},
 			fmt.Errorf("probing server capabilities: %w", err)
 	}
-	return HTTPServerCapabilities{ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording", FrictionReadable: response.JSON200.FrictionReadable != nil && *response.JSON200.FrictionReadable}, nil
+	return HTTPServerCapabilities{DocbankEnabled: response.JSON200.DocbankEnabled != nil && *response.JSON200.DocbankEnabled, ReadOnly: response.JSON200.ReadOnly != nil && *response.JSON200.ReadOnly, APIVersion: int(response.JSON200.APIVersion), NonRecordingRecall: response.HTTPResponse.Header.Get("X-Agentsview-Recall-Queries") == "non-recording", FrictionReadable: response.JSON200.FrictionReadable != nil && *response.JSON200.FrictionReadable}, nil
 }
 
 func (b *httpBackend) SupportsRecallQueries() bool { return b.recallQueries }
@@ -357,6 +363,7 @@ func (b *httpBackend) List(
 // server-side parser in internal/server/sessions.go.
 func filterToQuery(f service.ListFilter) (*apiclient.GetAPIV1SessionsQuery, error) {
 	q := &apiclient.GetAPIV1SessionsQuery{}
+	q.ExclusionCounts = f.ExclusionCounts
 	if f.IDs != nil {
 		ids, err := encodeSessionIDs(f.IDs)
 		if err != nil {
@@ -725,6 +732,7 @@ func (b *httpBackend) Stats(
 	q.IncludeAutomated = new(includeAutomated)
 	q.IncludeProject = append(q.IncludeProject, f.IncludeProjects...)
 	q.ExcludeProject = append(q.ExcludeProject, f.ExcludeProjects...)
+	q.OutcomesOnly = new(f.OutcomesOnly)
 	q.IncludeGitOutcomes = new(f.IncludeGitOutcomes)
 	q.IncludeGithubOutcomes = new(f.IncludeGitHubOutcomes)
 
@@ -816,7 +824,13 @@ func (b *httpBackend) SearchContent(
 	ctx context.Context, req service.ContentSearchRequest,
 ) (*service.ContentSearchResult, error) {
 	q := &apiclient.GetAPIV1SearchContentQuery{}
-	q.Pattern = req.Pattern
+	if req.KeywordFallback {
+		q.AllowKeywordFallback = new(true)
+	}
+	if req.Pattern != "" {
+		q.Pattern = new(req.Pattern)
+	}
+	q.Concepts = req.Concepts
 	if req.Mode != "" {
 		q.Mode = new(apiclient.GetAPIV1SearchContentQueryMode(req.Mode))
 	}
@@ -915,7 +929,7 @@ func (b *httpBackend) SearchContent(
 		q.Context = new(int64(req.Context))
 	}
 	var editors []runtime.RequestEditorFn
-	if req.Mode == "semantic" || req.Mode == "hybrid" {
+	if req.Mode == "semantic" || req.Mode == "hybrid" || len(req.Concepts) > 0 {
 		editors = append(editors, func(_ context.Context, r *http.Request) error {
 			r.Header.Set(service.SemanticSearchIntentHeader, service.SemanticSearchIntentValue)
 			return nil
@@ -1685,6 +1699,23 @@ func (b *httpBackend) apiClient(client *http.Client) (*apiclient.Client, error) 
 	return apiclient.NewHTTPClient(b.baseURL, b.token, client)
 }
 
+// HTTPErrorDetails exposes response status and its readable error field for
+// CLI presentation. It does not change the original error or its cause. Raw
+// bodies and request paths are deliberately excluded from the message.
+func HTTPErrorDetails(err error) (status int, message string, ok bool) {
+	statusErr, ok := errors.AsType[*httpStatusError](err)
+	if !ok {
+		return 0, "", false
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(statusErr.body, &payload) == nil {
+		message = payload.Error
+	}
+	return statusErr.statusCode, message, true
+}
+
 // IsRequestRejected reports whether err is a daemon's 4xx answer to a request.
 // Such an answer shows the daemon is reachable and serving, unlike a
 // connection failure, a timeout, or a 5xx error.
@@ -1736,4 +1767,34 @@ func (b *httpBackend) sessionWebURL(id string) string {
 	base.Fragment = ""
 	base.RawFragment = ""
 	return strings.TrimRight(base.String(), "/") + "/sessions/" + path
+}
+
+func (b *httpBackend) SessionCommits(ctx context.Context, id string) (*db.SessionCommitList, error) {
+	api, err := b.apiClient(b.client)
+	if err != nil {
+		return nil, err
+	}
+	response, err := api.GetAPIV1SessionsIDCommitsWithResponse(ctx, &apiclient.GetAPIV1SessionsIDCommitsRequestOptions{PathParams: &apiclient.GetAPIV1SessionsIDCommitsPath{ID: url.PathEscape(id)}})
+	if response == nil {
+		return nil, err
+	}
+	if err := serviceResponseError(response.HTTPResponse, response.Body, err); err != nil {
+		return nil, err
+	}
+	return response.JSON200, nil
+}
+
+func (b *httpBackend) CommitSessions(ctx context.Context, shas []string) (*db.CommitSessionList, error) {
+	api, err := b.apiClient(b.client)
+	if err != nil {
+		return nil, err
+	}
+	response, err := api.PostAPIV1CommitsSessionsWithResponse(ctx, &apiclient.PostAPIV1CommitsSessionsRequestOptions{Body: &apiclient.PostAPIV1CommitsSessionsBody{Shas: shas}})
+	if response == nil {
+		return nil, err
+	}
+	if err := serviceResponseError(response.HTTPResponse, response.Body, err); err != nil {
+		return nil, err
+	}
+	return response.JSON200, nil
 }

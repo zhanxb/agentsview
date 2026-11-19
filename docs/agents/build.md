@@ -9,10 +9,14 @@ Update the CI path filters when adding a reader of files in another lane.
 
 ## CI runner policy
 
-All CI jobs use standard GitHub-hosted runners, including fork pull requests,
+CI jobs use standard GitHub-hosted runners, including fork pull requests,
 scheduled checks, and desktop builds. Select labels from
 [GitHub's supported runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Keep the explicit architecture labels for Linux ARM64 and macOS desktop builds.
+
+The exceptions are the seconds-long `CI gate`, `changes`, and
+`Sibling pins on main` jobs. They run on the Namespace profile
+`namespace-profile-linux-1cpu` so they do not wait in the GitHub-hosted queue.
 
 Use the local `go-cache-restore` and `go-cache-save` actions for Go caches and
 disable the built-in cache in `actions/setup-go`. Use npm caching in
@@ -20,8 +24,11 @@ disable the built-in cache in `actions/setup-go`. Use npm caching in
 packages the job installs. Desktop jobs cache Rust dependencies through
 `Swatinem/rust-cache` with the GitHub cache backend. Pull-request workflow
 callers set `cache-mode: read` so jobs can restore caches without saving copies.
-Playwright jobs run browsers in Microsoft's public MCR image through a remote
-server.
+Cache owners opt in with `owner: true` to keep build entries used during the run
+and outputs referenced by fresh action records when refreshing a daily cache.
+Module caches stay on their existing restore and save paths, with all modules
+retained. Playwright jobs run browsers in Microsoft's public MCR image through
+a remote server.
 
 `desktop-artifacts.yml` builds the frontend once on Linux and packages those
 assets in its Windows, Linux, and Linux ARM64 desktop builds.

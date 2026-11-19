@@ -6,7 +6,9 @@ func (s *Server) registerTypedAPIRoutes() {
 	s.api.UseMiddleware(s.humaRequestInfoMiddleware)
 
 	s.registerHealthRoutes()
+	s.registerDaemonRoutes()
 	s.registerSessionRoutes()
+	s.registerCommitRoutes()
 	s.registerSessionAnnotationRoutes()
 	s.registerOpenersRoutes()
 	s.registerAnalyticsRoutes()

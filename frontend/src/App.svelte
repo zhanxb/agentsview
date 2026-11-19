@@ -68,6 +68,7 @@
   import ConfirmDeleteModal from "./lib/components/modals/ConfirmDeleteModal.svelte";
   import PerfDebugPanel from "./lib/components/debug/PerfDebugPanel.svelte";
   import AnalyticsPage from "./lib/components/analytics/AnalyticsPage.svelte";
+  import EmptyArchivePanel from "./lib/components/content/EmptyArchivePanel.svelte";
   import UsagePage from "./lib/components/usage/UsagePage.svelte";
   import ActivityPage from "./lib/components/activity/ActivityPage.svelte";
   import TrendsPage from "./lib/components/trends/TrendsPage.svelte";
@@ -144,6 +145,7 @@
     const route = router.route;
     const id = sessions.activeSessionId;
     void sessions.activeSessionLoadVersion;
+    let current = true;
     untrack(() => {
       const idChanged = id !== lastMessageLoadSessionId;
       lastMessageLoadSessionId = id;
@@ -180,10 +182,7 @@
         if (ui.isMobileViewport) {
           ui.closeSidebar();
         }
-        messages.loadSession(id);
-        sessions.loadChildSessions(id);
-        sessionTiming.load(id);
-        sync.watchSession(
+        const ready = sync.watchSession(
           id,
           () => {
             messages.reload();
@@ -199,6 +198,11 @@
             sessionTiming.applyEvent(t);
           },
         );
+        messages.loadSession(id, ready);
+        void ready.then((seen) => {
+          if (!seen && current) sessions.loadChildSessions(id);
+        });
+        sessionTiming.load(id);
         pins.loadForSession(id);
       } else {
         sessionActivity.clear();
@@ -209,6 +213,9 @@
         pins.clearSession();
       }
     });
+    return () => {
+      current = false;
+    };
   });
 
   // Scroll to pending ordinal once messages finish loading.
@@ -944,6 +951,8 @@
           onBack={() => sessions.deselectSession()}
         />
         <MessageList bind:this={messageListRef} />
+      {:else if sessions.archiveEmpty}
+        <EmptyArchivePanel />
       {:else}
         <AnalyticsPage
           suppressSessionDateRestore={rootDetailDateRestoreSuppressed}

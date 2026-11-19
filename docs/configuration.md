@@ -59,8 +59,10 @@ choice. To use a different directory, point those variables at a writable
 directory before you start AgentsView.
 
 The desktop app and CLI share a detached local daemon for fresh reads and
-writes. A running daemon owns local SQLite writes for this data directory and
-self-exits after an idle period. Ordinary session commands require the daemon.
+writes. A running daemon owns local SQLite writes for this data directory.
+Automatically started daemons self-exit after an idle period; `daemon start`
+and `daemon restart` stay running until stopped. Ordinary session commands
+require the daemon.
 Dedicated diagnostics, including `db adopt-machine --list` and `doctor sync`,
 can inspect the archive without starting it. Set `AGENTSVIEW_NO_DAEMON=1` when a
 script must never auto-start a daemon; commands that require one will refuse.
@@ -91,7 +93,7 @@ The daemon reads the policy when it starts, so a change takes effect after
 `agentsview daemon restart`. The policy applies when rows are written, so
 changing it does not rewrite rows already in the archive. To apply a narrower
 policy to an existing archive, set the key, restart the daemon, and run
-`agentsview sync --full`. The rebuild re-parses sessions whose source files
+`agentsview source sync --full`. The rebuild re-parses sessions whose source files
 still exist and copies archived sessions whose sources are gone, projecting both
 onto the policy. Back up the archive first: dropped content cannot be restored
 without the original source files.
@@ -102,7 +104,7 @@ which suits a dedicated reporting archive in its own data directory:
 ```bash
 AGENTSVIEW_DATA_DIR=~/.agentsview-usage \
 AGENTSVIEW_ARCHIVE_CONTENT=usage \
-agentsview sync
+agentsview source sync
 ```
 
 Limits of the narrower policies:
@@ -115,9 +117,10 @@ Limits of the narrower policies:
     be present in the archive, use `"usage"`, which stores no transcript text.
 - `"transcripts"` keeps session search, transcript viewing, and tool analytics
     working, but signals and secret findings that read tool inputs or results
-    (tool failure detection, repeated identical calls, secrets inside tool
-    output) see empty payloads. `result_content_blocked_categories` has no
-    additional effect under this policy. Archived RooCode, Kilo Legacy, gptme,
+    see empty payloads. Content-based tool failure detection and secrets inside
+    tool output find nothing, and no calls count as repeated identical calls.
+    `result_content_blocked_categories` has no additional effect under this
+    policy. Archived RooCode, Kilo Legacy, gptme,
     OpenHands, Aider, Codex, TraeX, and Zencoder sessions parsed before data
     version 105 and whose source files are gone cannot be re-parsed, so a
     rebuild drops every row shape those parsers once used for tool output. This
@@ -130,7 +133,7 @@ Limits of the narrower policies:
     pass refreshes it. With `[vector.embed] run_after_sync` enabled (the
     default) that pass starts right after the rebuild; otherwise let the
     scheduled pass run before pushing vectors to PostgreSQL.
-- `"usage"` supports usage reports such as `agentsview usage daily`. Session
+- `"usage"` supports usage reports such as `agentsview report usage daily`. Session
     search, transcript viewing, tool analytics, and content-derived quality
     metrics require a fuller archive. Insights and recall entries are refused,
     since both hold transcript-derived text. Recall extraction stops before
@@ -250,15 +253,33 @@ cursor_secret = "base64-encoded-secret"
 require_auth = true
 cursor_admin_api_key = "key_xxxxx"
 daemon_idle_timeout = "20m"
+sync_idle_after = "10m"
+sync_interval = "5s"
 chart_palette = "agentsview"
 zoom_level = 120
 ```
+
+`sync_idle_after` defaults to `"10m"`. After this long without a client request
+or an open event stream, local serve stops watching session files and pauses its
+local sync timers, remote-source sync, S3 imports, and attachment imports.
+Remote-host polling, Codex Cloud capture, replica push, and raw uploads keep their
+own schedules.
+The next archive request starts catch-up for files changed or added since
+collection paused. Requests share a two-second wait budget from the start of
+catch-up. After that, reads return immediately with a stale-results warning
+while catch-up continues in the
+background.
+The warning clears when catch-up finishes or fails, and failures are logged.
+Every client request except `/api/ping` counts as activity. Version and sync-status
+probes report readiness without starting catch-up.
+Desktop health probes keep the daemon alive without restarting sync.
+Set it to `"0"` to keep syncing while idle. Restart the server after changing it.
 
 | Field                               | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `local_machine_name`                | Optional display-name override; takes effect after a daemon restart                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `cursor_secret`                     | Auto-generated HMAC key for pagination cursor signing                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `cursor_admin_api_key`              | Cursor Admin API key used by `agentsview usage cursor`                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `cursor_admin_api_key`              | Cursor Admin API key used by `agentsview source cursor sync-usage`                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `cursor_admin_email`                | Optional default Cursor Admin usage filter by member email                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `cursor_admin_user_id`              | Optional default Cursor Admin usage filter by member user ID                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `github_token`                      | Optional saved GitHub token for Gist publishing                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -270,22 +291,26 @@ zoom_level = 120
 | `auth_token`                        | Auto-generated 256-bit bearer token for remote access; overridden by `AGENTSVIEW_AUTH_TOKEN`, or by `AGENTSVIEW_AUTH_TOKEN_FILE` under a [container deployment](#container-deployment)                                                                                                                                                                                                                                                                                           |
 | `public_url`                        | Browser URL, trusted origin, and managed Caddy site address                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `public_origins`                    | Additional trusted origins for request Host/Origin checks                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `daemon_idle_timeout`               | Idle timeout for detached writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `chart_palette`                     | Server-wide categorical chart colors: `"agentsview"` (default), `"matplotlib"`, or `"colorblind"`; also configurable under **Settings > Appearance**                                                                                                                                                                                                                                                                                                                                              |
+| `daemon_idle_timeout`               | Idle timeout for automatically started and `serve --background` writable daemons; set to `"0s"` to keep them alive                                                                                                                                                                                                                                                                                                                                                               |
+| `sync_idle_after`                   | Pause local collection after this long without client activity; defaults to `"10m"`, with `"0"` disabling the pause                                                                                                                                                                                                                                                                                                                                                              |
+| `sync_interval`                     | Minimum time between watcher-triggered session sync starts in `serve` and archive push commands. Default `"5s"`; use `"60s"` for less frequent syncs. Zero or negative durations disable the minimum interval. Applies on restart or when provider changes rebuild watchers. Raw sync, live-activity polling, and periodic catch-up keep their own timers.                                                                                                                       |
+| `chart_palette`                     | Server-wide categorical chart colors: `"agentsview"` (default), `"matplotlib"`, or `"colorblind"`; also configurable under **Settings > Appearance**                                                                                                                                                                                                                                                                                                                             |
 | `zoom_level`                        | Default interface zoom for clients without a local preference: `67`, `75`, `80`, `90`, `100`, `110`, `120`, `125`, `130`, `150`, `175`, or `200`. Defaults to `100` when omitted. Restart the daemon after manual edits                                                                                                                                                                                                                                                          |
 | `disabled_agents`                   | Session providers to exclude from local filesystem scanning — see [Disabling Session Providers](#disabling-session-providers)                                                                                                                                                                                                                                                                                                                                                    |
 | `[proxy]`                           | Managed proxy configuration table — see [Remote Access](/docs/remote-access/)                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `disable_update_check`              | Disable the automatic update check (see [Privacy](#privacy-and-telemetry))                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders and volumes under `/Volumes`, accepting one consent prompt per location — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                                                    |
+| `scan_protected_paths`              | Allow Git discovery inside macOS privacy-protected folders and volumes under `/Volumes`, accepting one consent prompt per location — see [macOS Protected Folders](#macos-protected-folders)                                                                                                                                                                                                                                                                                     |
 | `[pg]`                              | PostgreSQL sync configuration — see [PostgreSQL Sync](/docs/pg-sync/)                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `[duckdb]`                          | DuckDB mirror configuration — see [DuckDB Mirror](/docs/duckdb/)                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `[clickhouse]`                      | ClickHouse sync configuration — see [ClickHouse Sync](/docs/clickhouse-sync/)                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `[vector]`                          | Opt-in semantic-search index; model settings live in `[vector.embeddings]`, named endpoints in `[vector.embeddings.servers.<name>]`, embedding schedule in `[vector.embed]` — see [Semantic Search](/docs/semantic-search/#enabling-vector) for every key                                                                                                                                                                                                                        |
 | `[recall.extract]`                  | Opt-in model-backed recall extraction; named endpoints in `[recall.extract.servers.<name>]`, prompt selection in `[recall.extract.prompts]`, request overrides in `[recall.extract.request]` — see [Recall](/docs/recall/#automatic-extraction)                                                                                                                                                                                                                                  |
-| `[insights]`                        | Optional generated-insights endpoint and model, plus `default_agent`, the agent CLI new reports start with; local loopback HTTP is allowed, remote plaintext requires `allow_http = true`, and endpoint failures do not retry through a CLI — see [Recall](/docs/recall/#current-surface)                                                                                                                                                                                          |
-| `[friction]`                        | Opt-in Friction Log review; set `enabled = true` to review changed sessions in the background after each sync — see [Friction Log](#friction-log) |
+| `[integrations.docbank]` | Optional lookup of transcript image digests in Docbank; see [Find transcript images in Docbank](/docs/configuration/#find-transcript-images-in-docbank) |
+| `[insights]`                        | Optional generated-insights endpoint and model, plus `default_agent`, the agent CLI new reports start with; local loopback HTTP is allowed, remote plaintext requires `allow_http = true`, and endpoint failures do not retry through a CLI — see [Recall](/docs/recall/#current-surface)                                                                                                                                                                                        |
+| `[friction]`                        | Opt-in Friction Log review; set `enabled = true` to review changed sessions in the background after each sync — see [Friction Log](#friction-log)                                                                                                                                                                                                                                                                                                                                |
 | `[kata]`                            | Optional Kata issue-tracker connection; off by default; HTTPS needs `token_env` — see [Kata](/docs/kata/)                                         |
-| `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview sync` — see [CLI Reference](/docs/commands/#agentsview-sync)                                                                                                                                                                                                                                                                                                                                                                        |
+| `[[remote_hosts]]`                  | Remote machines synced by a bare `agentsview source sync` — see [CLI Reference](/docs/commands/#agentsview-sync)                                                                                                                                                                                                                                                                                                                                                                 |
+| `[agents.claude-ai]`                | Organizations Claude.ai Sync imports — see [Choose which organizations Sync imports](/docs/chat-import/#choose-which-organizations-sync-imports) |
 | `[[session_sources]]`               | Additional filesystem session roots with per-root machine keys — see [Filesystem Session Sync](/docs/filesystem-sync/)                                                                                                                                                                                                                                                                                                                                                           |
 | `[automated]`                       | Custom automated-session patterns — see [Automated Session Detection](#automated-session-detection)                                                                                                                                                                                                                                                                                                                                                                              |
 | `[custom_model_pricing]`            | Per-model price overrides for usage reports — see [Custom Model Pricing](/docs/token-usage/#custom-model-pricing)                                                                                                                                                                                                                                                                                                                                                                |
@@ -339,19 +364,19 @@ no deployment variables under it. A command that would read one, such as a
 daemon client with `AGENTSVIEW_AUTH_TOKEN_FILE` set, fails with the invalid
 mode instead.
 
-| Variable                             | Behavior                                                                                                                                                                                    |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AGENTSVIEW_MODE`                    | `serve` or `pg-serve`. When the command line is empty or starts with a flag other than `--help` or `--version`, the image runs `agentsview serve` or `agentsview pg serve` with those flags |
-| `PG_SERVE`                           | `1`, `true`, `yes`, or `on` selects `pg serve` when `AGENTSVIEW_MODE=serve`; kept for older deployments                                                                                     |
-| `AGENTSVIEW_HOST`                    | Listener address. A non-loopback value needs `AGENTSVIEW_REQUIRE_AUTH=true` or `require_auth = true`                                                                                        |
-| `AGENTSVIEW_REQUIRE_AUTH`            | Require bearer authentication for API access                                                                                                                                                |
-| `AGENTSVIEW_NO_BROWSER`              | Do not open a browser on start                                                                                                                                                              |
-| `AGENTSVIEW_AUTH_TOKEN_FILE`         | File holding the bearer token; overrides `auth_token` in `config.toml`. `~/` expands to the home directory. Cannot be combined with `AGENTSVIEW_AUTH_TOKEN`                                 |
-| `AGENTSVIEW_PG_ALLOW_INSECURE`       | Sets `allow_insecure` for the default PostgreSQL target, for a database on a private network without TLS                                                                                    |
-| `AGENTSVIEW_EMBEDDINGS_ENDPOINT`     | OpenAI-compatible embeddings endpoint for recipe adoption in `pg push --embed` and `pg serve`; local `serve` ignores it. See [semantic search on PostgreSQL](/docs/semantic-search/)        |
-| `AGENTSVIEW_EMBEDDINGS_API_KEY`      | Inline API key for that endpoint; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT` and cannot be combined with the file form                                                                        |
-| `AGENTSVIEW_EMBEDDINGS_API_KEY_FILE` | File holding that endpoint's API key; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT`                                                                                                             |
-| `AGENTSVIEW_EMBEDDINGS_BATCH_SIZE`   | Inputs per embeddings request; positive integer, default `32`; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT`. Lower it for providers with request token limits.                                 |
+| Variable                             | Behavior                                                                                                                                                                                            |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AGENTSVIEW_MODE`                    | `serve` or `pg-serve`. When the command line is empty or starts with a flag other than `--help` or `--version`, the image runs `agentsview serve` or `agentsview replica pg serve` with those flags |
+| `PG_SERVE`                           | `1`, `true`, `yes`, or `on` selects `pg serve` when `AGENTSVIEW_MODE=serve`; kept for older deployments                                                                                             |
+| `AGENTSVIEW_HOST`                    | Listener address. A non-loopback value needs `AGENTSVIEW_REQUIRE_AUTH=true` or `require_auth = true`                                                                                                |
+| `AGENTSVIEW_REQUIRE_AUTH`            | Require bearer authentication for API access                                                                                                                                                        |
+| `AGENTSVIEW_NO_BROWSER`              | Do not open a browser on start                                                                                                                                                                      |
+| `AGENTSVIEW_AUTH_TOKEN_FILE`         | File holding the bearer token; overrides `auth_token` in `config.toml`. `~/` expands to the home directory. Cannot be combined with `AGENTSVIEW_AUTH_TOKEN`                                         |
+| `AGENTSVIEW_PG_ALLOW_INSECURE`       | Sets `allow_insecure` for the default PostgreSQL target, for a database on a private network without TLS                                                                                            |
+| `AGENTSVIEW_EMBEDDINGS_ENDPOINT`     | OpenAI-compatible embeddings endpoint for recipe adoption in `pg push --embed` and `pg serve`; local `serve` ignores it. See [semantic search on PostgreSQL](/docs/semantic-search/)                |
+| `AGENTSVIEW_EMBEDDINGS_API_KEY`      | Inline API key for that endpoint; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT` and cannot be combined with the file form                                                                               |
+| `AGENTSVIEW_EMBEDDINGS_API_KEY_FILE` | File holding that endpoint's API key; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT`                                                                                                                     |
+| `AGENTSVIEW_EMBEDDINGS_BATCH_SIZE`   | Inputs per embeddings request; positive integer, default `32`; requires `AGENTSVIEW_EMBEDDINGS_ENDPOINT`. Lower it for providers with request token limits.                                         |
 
 Anyone who can inspect the container can read `AGENTSVIEW_EMBEDDINGS_API_KEY`,
 and every process AgentsView starts, such as an agent CLI, inherits it. Use
@@ -399,7 +424,7 @@ naming the file.
 
 ## Remote Hosts
 
-Add `[[remote_hosts]]` entries when a bare `agentsview sync` should include raw
+Add `[[remote_hosts]]` entries when a bare `agentsview source sync` should include raw
 session files from other machines. `transport` is `"http"` (the default when
 omitted) or `"ssh"`. An HTTP entry needs an AgentsView daemon on the remote host
 and a private network such as Tailscale to reach it:
@@ -462,7 +487,7 @@ Each `remote_hosts.host` value must be unique and stable. It namespaces imported
 session IDs, the database skip cache, and the persistent mirror; changing it for
 the same machine can duplicate sessions, while reusing it for another machine
 can reuse stale state. Select a configured host with
-`agentsview sync --host <name>`, including for direct sync with
+`agentsview source sync --host <name>`, including for direct sync with
 `AGENTSVIEW_NO_DAEMON=1`. Unknown host names are rejected; ad hoc remotes are
 not supported. HTTP failures are summarized with actionable messages for common
 cases such as token rejection, missing remote archive endpoints, connection
@@ -471,7 +496,7 @@ refusal, DNS failures, and timeouts. For how SSH failures are reported, see
 
 Set `interval` to a positive duration such as `"5m"` to have a running collector
 daemon sync that host periodically. Zero or omitted disables the per-host
-schedule; manual `agentsview sync` still includes the host.
+schedule; manual `agentsview source sync` still includes the host.
 
 The remote daemon must also listen on an interface the collector can reach. The
 server binds `127.0.0.1` by default, so set `host` in the remote machine's
@@ -494,10 +519,10 @@ For a one-off flag override, `agentsview serve --background --host 0.0.0.0`
 remains available, including without auth. Prefer authenticated persistent
 configuration for an always-available remote node.
 
-Detached writable daemons started by `agentsview daemon start`, automatic CLI
-startup, or `agentsview serve --background` exit after `daemon_idle_timeout`
-when idle. Set it to zero on machines that should stay available for HTTP remote
-sync:
+Explicit `agentsview daemon start` and `daemon restart` stay running until
+stopped. Automatic CLI startup and `agentsview serve --background` exit after
+`daemon_idle_timeout` when idle. Set it to zero on machines that should stay
+available for HTTP remote sync:
 
 ```toml
 daemon_idle_timeout = "0s"
@@ -509,9 +534,9 @@ of this setting.
 
 ## Cursor Admin Usage API
 
-`agentsview usage cursor` imports Cursor Admin API usage events into the local
+`agentsview source cursor sync-usage` imports Cursor Admin API usage events into the local
 archive so Cursor's billed usage can appear in the Usage dashboard and
-`agentsview usage daily` reports. Set the API key in
+`agentsview report usage daily` reports. Set the API key in
 `~/.agentsview/config.toml`:
 
 ```toml
@@ -531,7 +556,7 @@ export AGENTSVIEW_CURSOR_ADMIN_USER_ID=152683922
 The legacy unprefixed names `CURSOR_ADMIN_API_KEY`, `CURSOR_ADMIN_EMAIL`, and
 `CURSOR_ADMIN_USER_ID` are also accepted when the matching `AGENTSVIEW_`
 variable is unset. The email and user ID values are default filters; pass
-`--email` or `--user-id` to `agentsview usage cursor` to override them for one
+`--email` or `--user-id` to `agentsview source cursor sync-usage` to override them for one
 import.
 
 ## Session Discovery
@@ -598,6 +623,7 @@ keeps its default directories.
 | OpenClaw              | `~/.openclaw/agents/` and `~/.kimi_openclaw/agents/`                                                                                                             | JSONL per session or SQLite per agent (`agent/openclaw-agent.sqlite`)                                                                                        |
 | OpenCode              | `~/.local/share/opencode/`                                                                                                                                       | SQLite DB or `storage/` JSON files                                                                                                                            |
 | Open Code Review      | `~/.opencodereview/sessions/`                                                                                                                                    | One JSONL file per review under an encoded project directory                                                                                                  |
+| Open Interpreter      | `~/.openinterpreter/sessions/`, `archived_sessions/`                                                                                                             | Codex-format JSONL per session                                                                                                                                |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                    | Per-conversation `base_state.json` + `events/*.json`                                                                                                          |
 | Omnigent              | `~/.omnigent/`                                                                                                                                                   | SQLite `chat.db`, one session per conversation                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                          | JSONL per session                                                                                                                                             |
@@ -642,6 +668,15 @@ reads it without writing or migrating the database.
 under the separate `augure-code` agent ID. Set `AUGURE_CODE_SESSIONS_DIR` or
 `agents.augure-code.dirs` for another sessions root. Resume these sessions with
 `augure resume`, not `codex resume`.
+
+**Open Interpreter** reads Codex-format JSONL from
+`~/.openinterpreter/sessions/` and `~/.openinterpreter/archived_sessions/` and
+appears under the separate `open-interpreter` agent ID. Set `INTERPRETER_HOME`
+to move both defaults, as Open Interpreter itself does, or set
+`OPEN_INTERPRETER_SESSIONS_DIR` or `agents.open-interpreter.dirs` for other
+sessions roots. `CODEX_HOME` does not affect these paths. Resume these sessions
+with `interpreter resume`. Sessions are titled by their first prompt; names
+set with Open Interpreter's rename command are not read.
 
 **Augure Desktop 3 beta** reads `state.db` and its `sessions/` sibling from
 `~/.augure-desktop/` on macOS and Linux, or `~/AppData/Local/augure-desktop/` on
@@ -1153,6 +1188,7 @@ export VIBE_SESSIONS_DIR=~/custom/vibe/logs/session
 export OMP_DIR=~/custom/omp
 export OPENCLAW_DIR=~/custom/openclaw
 export OPENCODE_DIR=~/custom/opencode
+export OPEN_INTERPRETER_SESSIONS_DIR=~/custom/openinterpreter/sessions
 export OPENCODEREVIEW_DIR=~/custom/opencodereview/sessions
 export OPENHANDS_CONVERSATIONS_DIR=~/custom/openhands
 export PI_DIR=~/custom/pi
@@ -1367,10 +1403,10 @@ listening in on, that it is listening in on none right now, that live tokens are
 off and why, or that live tokens stopped after a reply AgentsView could not
 read.
 
-A detached daemon normally exits once it has been idle for `daemon_idle_timeout`.
-While AgentsView is listening in on a running chat, the daemon stays up past that
-timeout, for at most 6 hours per chat. A daemon that is shutting down does not
-start listening in on new chats.
+An automatically started daemon normally exits once it has been idle for
+`daemon_idle_timeout`. While AgentsView is listening in on a running chat, the
+daemon stays up past that timeout, for at most 6 hours per chat. A daemon that
+is shutting down does not start listening in on new chats.
 
 Each token update carries the chat's running total, so an update also covers
 every turn that finished before it, back to the last time OpenAI restarted that
@@ -1386,7 +1422,7 @@ A chat that AgentsView never listened in on, or listened in on without receiving
 a token update, has no token counts. For those, AgentsView asks OpenAI's usage
 report for the chat's share of your plan's weekly and five-hour limits, and the
 credits figure the report includes. That plan usage shows in the session
-details. Such sessions are left out of token and cost totals; `agentsview usage`
+details. Such sessions are left out of token and cost totals; `agentsview report usage`
 reports how many were left out. That count includes a chat AgentsView has not
 asked about yet, such as one waiting while plan usage is paused. Its session
 details say "Plan usage: not checked yet" until the first answer arrives.
@@ -1678,7 +1714,7 @@ source local.
 
 Machine attribution is captured when each session is first ingested. Changing an
 entry's `machine` value affects newly discovered sessions but does not relabel
-existing sessions during ordinary syncs or `agentsview sync --full`. To adopt
+existing sessions during ordinary syncs or `agentsview source sync --full`. To adopt
 old keys belonging to this installation, use
 [`agentsview db adopt-machine`](/docs/commands/#agentsview-db-adopt-machine).
 
@@ -1725,6 +1761,12 @@ matching objects, fetches each changed object to a temporary file, parses it
 with the existing per-agent parser, records the original `s3://` URI as
 `file_path`, and removes the temporary file. No persistent local mirror is
 created.
+
+Codex forks and subagents also need their parent's rollouts to filter replayed
+turns. A sync downloads each parent once and shares it with every child it
+processes. If a parent's object changes during the sync, later children get
+the new version. The sync keeps about 512 MiB of recent parent rollouts in a
+temporary directory and removes that directory when the sync ends.
 
 Credentials and endpoint configuration use standard AWS-style environment
 variables:
@@ -1852,11 +1894,12 @@ Entries are trimmed, deduplicated, and capped at 1024 characters. Entries that
 duplicate a built-in pattern in the same category are silently dropped.
 
 **Reclassification on config change.** AgentsView stores a hash of the active
-classifier (built-in patterns + your configured patterns) with the database. On
-startup, it rechecks stored `is_automated` values against the active classifier
-and re-stamps the hash, so edits to `[automated]` patterns apply to history
-immediately — no manual resync required. The same backfill also corrects rows
-pulled in from PostgreSQL sync or copied from other archives.
+classifier (built-in patterns + your configured patterns) with the database.
+For archives that retain transcript text, startup rechecks changed and imported
+sessions. When the classifier changes, it rechecks all sessions, so edits to
+`[automated]` patterns apply to history immediately without a manual resync.
+The same backfill corrects rows pulled in from PostgreSQL sync or copied from
+other archives.
 
 ## Database
 
@@ -1989,14 +2032,14 @@ it is held exclusively for each import pass. Opening it may apply Docbank
 catalog upgrades. AgentsView opens the source `sessions.db` read-only and writes
 parsed results to the receiving installation.
 
-Restart a running daemon after editing the file, then run `agentsview sync`. The
+Restart a running daemon after editing the file, then run `agentsview source sync`. The
 first sync reads the supported sources and reports pending work, captured
 deletion rules, and supplemental files. Sessions retain the original machine's
 identity and label. `name` labels the configuration entry; changing it does not
 change session ownership.
 
-A daemon started with `--no-sync` still handles manual `agentsview sync` and
-`agentsview sync --full`; automatic ingestion stays disabled.
+A daemon started with `--no-sync` still handles manual `agentsview source sync` and
+`agentsview source sync --full`; automatic ingestion stays disabled.
 
 Pushes to PostgreSQL, ClickHouse, and DuckDB also read pending attached history
 after successful local sync, including on a `--no-sync` daemon. A push watch
@@ -2035,14 +2078,14 @@ Disconnecting the archive leaves already indexed history browsable. Sync reports
 the unavailable source and retries on a later pass. When a source fails to copy
 or parse, the next scheduled sync tries it again. If that retry also fails,
 scheduled syncs and pushes wait an hour, doubling to a day, and report the
-recorded error meanwhile. A manual `agentsview sync` retries immediately;
+recorded error meanwhile. A manual `agentsview source sync` retries immediately;
 restarting the daemon clears the wait. To move the archive, change `repository`
 and restart the daemon. A copied repository with the same repository ID and
 pinned snapshot continues the same history. A different repository at that path
 is refused. For a directory source, update `directory`; the archive identity and
 accepted source records remain independent of its path.
 
-Parser upgrades reparse available sources. Use `agentsview sync --full` to
+Parser upgrades reparse available sources. Use `agentsview source sync --full` to
 request a full reparse; individual session refresh directs attached history to
 that command. Local ingestion runs first and gets a turn between archive
 sources. It can still wait for one large source's parse: 16 GiB is a size limit,
@@ -2095,7 +2138,8 @@ mechanisms:
 
 1. **File watcher** — uses FSEvents on macOS and fsnotify elsewhere to detect
     file changes. An isolated edit is batched for 500ms; watcher-driven sync
-    start times remain at least five seconds apart. Common dependency and build
+    start times remain at least five seconds apart by default (see
+    [`sync_interval`](#config-file)). Common dependency and build
     folders (`node_modules`, `__pycache__`, `.git`, `vendor`, `dist`, etc.) are
     automatically skipped to reduce noise and overhead. On macOS, FSEvents
     reports a file that its producer keeps open only when the file is created
@@ -2197,6 +2241,11 @@ enabled = true
 backfill_days = 7
 timezone = "" # Local time on SQLite, UTC on PostgreSQL; or an IANA zone.
 seat_patterns = [] # Optional path globs with one whole-segment {seat} capture.
+
+[friction.kata]
+auto_file = false # The hub files recent patterns to Kata every hour.
+kinds = [] # Kinds to file automatically; empty means all that can be filed.
+min_sessions = 2 # File only patterns seen in at least this many sessions.
 ```
 
 Restart the daemon after changing this setting. When enabled:
@@ -2219,6 +2268,8 @@ An hourly job builds one stored digest per completed local day, catching up
 within `backfill_days` (1–3650, default 7). It never builds today. Set
 `AGENTSVIEW_FRICTION_TZ` to override the configured timezone. Seat patterns label
 digest findings from session paths without changing the stored detections.
+`[friction.kata]` needs `[kata]` enabled on the hub; see
+[File patterns automatically](/docs/kata/#file-patterns-automatically).
 
 Digests keep Markdown, schema 1 summary JSON, frozen findings and usage,
 session membership, and pattern recurrence. SQLite keeps this state through a
@@ -2294,7 +2345,7 @@ Notes:
     are skipped while the filter is set.
 - The filter gates ingestion only. Sessions already in the archive are preserved
     (the SQLite database is a persistent archive); remove unwanted existing
-    sessions explicitly with `agentsview prune`.
+    sessions explicitly with `agentsview session prune`.
 - Remote-host sync is unaffected: the prefixes describe local paths, so they are
     not applied to sessions pulled from `[[remote_hosts]]` entries.
 
@@ -2346,25 +2397,26 @@ The option has no effect on other platforms.
 
 Enabling the option applies to sessions parsed after the change. Sessions
 already in the archive keep their path-only identity until their session files
-change; run `agentsview sync --full` to reparse the archive and pick up Git
+change; run `agentsview source sync --full` to reparse the archive and pick up Git
 detail for existing sessions.
 
 ### Large Watch Trees
 
-The recursive watcher has a hard budget of 8192 directories per process. If a
-session root is larger than the remaining budget, or if registering watches hits
-the operating system's inotify or file-descriptor limit (`ENOSPC` / `EMFILE`),
-as of 0.27.0 AgentsView **degrades** that root to polling instead of aborting
-startup. The HTTP listener is now bound before any watches are registered, so
-the server still comes up cleanly.
+On Linux, the recursive watcher watches every directory until the kernel's
+`fs.inotify.max_user_watches` limit runs out. Windows and other non-macOS
+platforms keep a budget of 8,192 directories per process. The macOS FSEvents
+watcher has no per-directory budget. If a session root exceeds the remaining
+budget, or registering watches hits the operating system's inotify or
+file-descriptor limit (`ENOSPC` / `EMFILE`), AgentsView polls that root. The
+HTTP listener binds before any watches are registered, so the server still
+starts.
 
 Providers can also cap how deep a recursive root is watched when they read only
 a fixed depth. Antigravity and Antigravity CLI `brain` folders are watched one
 level deep, so the generated trees inside each `brain/<id>` do not count
 against the budget. The Antigravity IDE watcher also watches
 `brain/<id>/.system_generated/logs`, which holds the plaintext transcript.
-This cap applies to the Linux and Windows watcher. The macOS FSEvents watcher
-has no per-directory budget.
+The depth cap applies wherever the fsnotify watcher runs.
 
 Runtime folder watch failures keep healthy folders on native watches. Claude
 polling covers the affected project folder. Other providers poll the root's
@@ -2406,14 +2458,16 @@ sudo sysctl fs.inotify.max_user_watches=524288
 
 ## Memory Behavior
 
-The serve daemon bounds its own memory, so no tuning is required. It installs a
-256 MiB Go soft memory limit, and on Linux it also limits glibc to two malloc
-arenas and pins the heap trim threshold at 1 MiB. Pinning the threshold turns
-off glibc's dynamic adjustment, which otherwise lets a long-running process stop
-trimming until as much as 64 MiB is free, so memory freed by the SQLite driver
-goes back to the operating system instead of accumulating as fragmentation.
-Setting `GOMEMLIMIT`, `MALLOC_ARENA_MAX`, or `MALLOC_TRIM_THRESHOLD_` in the
-daemon's environment overrides the corresponding default.
+The serve daemon installs a 4 GiB Go soft memory limit as a backstop so large
+requests run with normal GC pacing. Setting `GOMEMLIMIT` lower trades GC time
+for a smaller heap. On Linux, every agentsview process limits glibc to two
+malloc arenas and pins the heap trim threshold at 1 MiB. Pinning the threshold
+turns off glibc's dynamic adjustment, which otherwise lets a long-running
+process stop trimming until as much as 64 MiB is free, so memory freed by the
+SQLite driver goes back to the operating system instead of accumulating as
+fragmentation. Setting `GOMEMLIMIT`, `MALLOC_ARENA_MAX`, or
+`MALLOC_TRIM_THRESHOLD_` in the process's environment overrides the
+corresponding default.
 
 ## Manual Sync
 
@@ -2438,8 +2492,8 @@ Check sync status:
 curl http://127.0.0.1:8080/api/v1/sync/status
 ```
 
-The JSON response includes `startup_pending` and `archive_stale` alongside
-sync progress.
+The JSON response includes `startup_pending`, `archive_stale`, and, starting
+with daemon API 15, `sync_pending` alongside sync progress.
 
 ## Privacy and Telemetry
 
@@ -2638,3 +2692,57 @@ Disable the CLI/web UI update check with any of:
 
 The desktop app's auto-updater is controlled separately via
 `AGENTSVIEW_DESKTOP_AUTOUPDATE=0`.
+
+## Find transcript images in Docbank
+
+Configure your Docbank server to find where it holds the exact bytes of a
+transcript image. Results show current files, prior versions, and trash. Set
+`web_url` to make each match link to its exact version in the browser.
+Exact-version links require
+[docbank#1024](https://github.com/kenn-io/docbank/pull/1024).
+
+```toml
+[integrations.docbank]
+url = "https://docbank.example.com"
+web_url = "https://docbank.example.com"
+api_key_env = "DOCBANK_API_KEY"
+```
+
+Set `DOCBANK_API_KEY` in the environment of each consumer, including the
+daemon, CLI, and MCP server. Both `url` and `api_key_env` are required to enable
+lookup. Omit the section to disable it. The server refuses to start with an
+invalid section; other commands print a warning and leave lookup off. CLI
+commands that connect to a daemon use the daemon's integration configuration.
+
+MCP offers `get_session_file_references` when its backend enables Docbank
+lookup. Connections through a signed reader listener omit this tool.
+
+| Setting                            | Purpose                                           |
+| ---------------------------------- | ------------------------------------------------- |
+| `integrations.docbank.url`         | Docbank API base URL. HTTPS, or HTTP on loopback. |
+| `integrations.docbank.web_url`     | Optional browser base URL for version links.      |
+| `integrations.docbank.api_key_env` | Environment variable containing the API key.      |
+
+Lookup covers retained tool-result images, including offloaded assets, inline
+OpenCode `file.uri` payloads such as PDF and text files, and Markdown `asset://`
+images in message text. Claude pasted images aren't covered yet. Native Codex
+attachments and files handled by tools require exact bytes in the archive;
+paths and references alone aren't covered.
+
+Only SHA-256 digests leave the machine. Docbank file names, paths, and trash
+entries come back with the results, so anyone who can read sessions on this
+server can see them.
+
+Transcript reads run independently of Docbank. Database reads and Docbank
+requests each have their own five-second budget. Each lookup resolves up to 50
+distinct digests with four requests at a time and shows up to ten matches per
+digest. Docbank lookup failures report Docbank unavailable and can be retried;
+after the first failed lookup, a request stops asking Docbank and reports its
+remaining digests unavailable. Archive read failures report session files
+unavailable. Digests beyond the cap report `limit_exceeded` without Retry.
+Images dropped by the image policy have no bytes to hash, so they report
+`bytes_not_kept` without a lookup.
+
+Results refresh when the session reopens and when its transcript changes, at
+most every 15 seconds while matches are already shown. Successful Docbank
+answers are reused for one minute. No migration or resync is required.

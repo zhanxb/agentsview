@@ -91,3 +91,6 @@ graphify-out/
 
 # WorkBuddy 工作区（本地记忆与自动化，不进版本库）
 .workbuddy/
+
+# gotestsum JSON events and rerun reports written by CI test targets
+/gotestsum/

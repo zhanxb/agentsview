@@ -15,6 +15,9 @@ import (
 // complete message set to store, the computed signal values,
 // and the data version to stamp after messages are written.
 type SessionBatchWrite struct {
+	CodexForkState *CodexForkState
+	// StagedToolKeys maps final occurrence keys back to the parsed scratch keys.
+	StagedToolKeys    map[string]string
 	ArchiveProvenance *ArchiveSessionProvenance
 	Session           Session
 	Messages          []Message
@@ -267,13 +270,17 @@ func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 	var writtenUsageIDs []string
 
 	for i, write := range writes {
-		write = db.storageSessionBatchWrite(sanitizeSessionBatchWrite(write))
-		messagesWritten, err := db.writeOneSessionBatchTx(
-			context.Background(), tx, tx,
-			write,
-			&pendingRecallRevocations,
-			db.usageOnlyStorage(), nil,
-		)
+		sanitized, err := sanitizeSessionBatchWriteContext(ctx, write)
+		var messagesWritten int
+		if err == nil {
+			write = db.storageSessionBatchWrite(sanitized)
+			messagesWritten, err = db.writeOneSessionBatchTx(
+				ctx, tx, tx,
+				write,
+				&pendingRecallRevocations,
+				db.usageOnlyStorage(), nil,
+			)
+		}
 		if err != nil {
 			result.WrittenSessions = 0
 			result.WrittenMessages = 0
@@ -318,11 +325,6 @@ func (db *DB) WriteSessionBatchAtomic(ctx context.Context,
 	db.notifyUsageSessions(writtenUsageIDs)
 	pendingRecallRevocations.flush()
 	return result, nil
-}
-
-func sanitizeSessionBatchWrite(write SessionBatchWrite) SessionBatchWrite {
-	sanitized, _ := sanitizeSessionBatchWriteContext(context.Background(), write)
-	return sanitized
 }
 
 func sanitizeSessionBatchWriteContext(
@@ -806,12 +808,12 @@ func extendTruncatedTextTx(
 			continue
 		}
 		var id int64
-		var stored string
+		var stored, thinking string
 		err := tx.QueryRow(
-			`SELECT id, content FROM messages
+			`SELECT id, content, thinking_text FROM messages
 			 WHERE session_id = ? AND ordinal = ?`,
 			sessionID, m.Ordinal,
-		).Scan(&id, &stored)
+		).Scan(&id, &stored, &thinking)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -824,10 +826,11 @@ func extendTruncatedTextTx(
 		if !IsTextExtension(stored, m.Content) {
 			continue
 		}
+		dialogue, dialogueIsContent := StoredDialogue(m.Content, thinking, m.DialogueText)
 		if _, err := tx.Exec(
-			`UPDATE messages SET content = ?, content_length = ?, dialogue_text = ?
+			`UPDATE messages SET content = ?, content_length = ?, dialogue_text = ?, dialogue_is_content = ?
 			 WHERE id = ?`,
-			m.Content, m.ContentLength, m.DialogueText, id,
+			m.Content, m.ContentLength, dialogue, dialogueIsContent, id,
 		); err != nil {
 			return 0, fmt.Errorf(
 				"extending text for %s ordinal %d: %w",
@@ -921,6 +924,9 @@ func writeSessionBatchMetadataTx(ctx context.Context, tx *sql.Tx, queries transa
 		); err != nil {
 			return err
 		}
+	}
+	if err := writeCodexForkStateTx(ctx, tx, write.Session.ID, write.CodexForkState); err != nil {
+		return err
 	}
 	if err := replaceSessionUsageEventsTx(
 		queries, write.Session.ID, write.UsageEvents, false,

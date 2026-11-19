@@ -19,13 +19,21 @@ import (
 	"go.kenn.io/agentsview/internal/stringutil"
 )
 
+var claudeHookSubtypeSQL = "('" + strings.Join(parser.ClaudeHookSubtypes(), "', '") + "')"
+
+// ExcludeClaudeHooksSQL excludes imported hooks while retaining other system rows.
+// subtypeColumn is a trusted SQL column reference, optionally qualified.
+func ExcludeClaudeHooksSQL(subtypeColumn string) string {
+	return "COALESCE(" + subtypeColumn + ", '') NOT IN " + claudeHookSubtypeSQL
+}
+
 const (
 	selectMessageCols = `id, session_id, ordinal, role, content,
-		thinking_text, dialogue_text, ` + selectMessageMetadataCols
+		thinking_text, dialogue_text, dialogue_is_content, ` + selectMessageMetadataCols
 
 	// Bounded transcript loaders don't need the search projection.
 	selectTranscriptMessageCols = `id, session_id, ordinal, role, content,
-		thinking_text, NULL AS dialogue_text, ` + selectMessageMetadataCols
+		thinking_text, NULL AS dialogue_text, 0 AS dialogue_is_content, ` + selectMessageMetadataCols
 
 	selectMessageMetadataCols = `COALESCE(timestamp, '') AS timestamp,
 		has_thinking, has_tool_use, content_length,
@@ -37,7 +45,7 @@ const (
 		source_parent_uuid, is_sidechain, is_compact_boundary`
 
 	insertMessageCols = `session_id, ordinal, role, content,
-		thinking_text, dialogue_text,
+		thinking_text, dialogue_text, dialogue_is_content,
 		timestamp, has_thinking, has_tool_use, content_length,
 		is_system,
 		model, reasoning_effort, token_usage, context_tokens, output_tokens, provider_id,
@@ -58,7 +66,7 @@ const (
 	// Keep multi-row INSERT statements below SQLite's historic
 	// 999-variable limit so binaries built against older SQLite
 	// versions still work.
-	messageInsertRowsPerStmt         = 34  // 29 params per row
+	messageInsertRowsPerStmt         = 33  // 30 params per row
 	toolCallInsertRowsPerStmt        = 66  // 15 params per row
 	toolResultEventInsertRowsPerStmt = 70  // 14 params per row
 	toolCallAgentStateRowsPerStmt    = 142 // 7 params per row
@@ -77,7 +85,7 @@ type ToolCall struct {
 	ToolUseID           string            `json:"tool_use_id,omitempty"`
 	InputJSON           string            `json:"input_json,omitempty"`
 	FilePath            string            `json:"-"`
-	CallIndex           int               `json:"-"`
+	CallIndex           int               `json:"call_index"`
 	SkillName           string            `json:"skill_name,omitempty"`
 	ResultContentLength int               `json:"result_content_length,omitempty"`
 	ResultContent       string            `json:"result_content,omitempty"`
@@ -1311,7 +1319,7 @@ func insertMessagesTx(
 	for start := 0; start < len(msgs); start += messageInsertRowsPerStmt {
 		end := min(start+messageInsertRowsPerStmt, len(msgs))
 		batch := msgs[start:end]
-		args := make([]any, 0, len(batch)*29)
+		args := make([]any, 0, len(batch)*30)
 		for i, m := range batch {
 			id := nextID + int64(start+i)
 			ids[start+i] = id
@@ -1321,7 +1329,7 @@ func insertMessagesTx(
 		query := fmt.Sprintf(
 			"INSERT INTO messages (id, %s) VALUES %s",
 			insertMessageCols,
-			multiRowPlaceholders(len(batch), 29),
+			multiRowPlaceholders(len(batch), 30),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			first := batch[0].Ordinal
@@ -1886,7 +1894,7 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 		}
 	}
 	if transcriptChanged {
-		if err := bumpTranscriptRevisionTx(tx, sessionID); err != nil {
+		if err := bumpIncrementalTranscriptRevisionTx(tx, sessionID, msgs, update); err != nil {
 			return false, err
 		}
 	}
@@ -1925,7 +1933,7 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 	signalsMaintained := false
 	if !db.ArchiveContent().OmitsToolContent() && update.SignalMaintainer != nil {
 		delta, err := update.SignalMaintainer.MaintainTx(
-			context.Background(), signalTxQuery{
+			ctx, signalTxQuery{
 				tx:                          tx,
 				sessionID:                   sessionID,
 				insertedResultEvents:        insertedResultEvents,
@@ -2083,7 +2091,9 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
 ) error {
 	msgs, _ = db.ProjectToolResultImagesWithPolicy(msgs, policy)
 	msgs = append([]Message(nil), msgs...)
-	_ = ValidateAndSanitize(nil, msgs, nil)
+	if _, err := ValidateAndSanitizeContext(ctx, nil, msgs, nil); err != nil {
+		return err
+	}
 	rawMessages := msgs
 	msgs = db.messagesForStorage(msgs)
 
@@ -2109,7 +2119,7 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
 	// entries; fall back to the full delete+reinsert for
 	// truncations, reorders, and wholesale rewrites.
 	plan, stored, useDiff, storedLoaded := db.planStoredMessageDiff(
-		sessionID, msgs,
+		ctx, sessionID, msgs,
 	)
 	transcriptChanged := !storedLoaded ||
 		!transcriptMessagesEqual(stored, msgs)
@@ -2153,7 +2163,7 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
 	}
 	if !useDiff || len(plan.updates) > 0 {
 		if err := reconcileRecallEvidenceForSessionTx(
-			context.Background(), tx, sessionID, &pendingRecallRevocations,
+			ctx, tx, sessionID, &pendingRecallRevocations,
 		); err != nil {
 			return err
 		}
@@ -2286,7 +2296,10 @@ func replaceSessionMessagesTx(
 // mutated existing session. Touching local_modified_at fires the
 // sync_marker trigger so push targets re-select the session.
 func bumpTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
-	return bumpTranscriptRevision(tx, sessionID, true)
+	if err := bumpTranscriptRevision(tx, sessionID, true); err != nil {
+		return err
+	}
+	return refreshSessionCommitLinksTx(tx, sessionID)
 }
 
 // bumpInsertedTranscriptRevisionTx advances the revision for a session
@@ -2294,7 +2307,10 @@ func bumpTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
 // sync_marker, so skipping the local_modified_at touch avoids a
 // redundant trigger recompute on every bulk-loaded session.
 func bumpInsertedTranscriptRevisionTx(tx transactionQueries, sessionID string) error {
-	return bumpTranscriptRevision(tx, sessionID, false)
+	if err := bumpTranscriptRevision(tx, sessionID, false); err != nil {
+		return err
+	}
+	return refreshSessionCommitLinksTx(tx, sessionID)
 }
 
 func bumpTranscriptRevision(
@@ -2379,13 +2395,19 @@ func sessionHasCurrentCJKFTSTx(
 func deleteSessionMessageRowsTx(
 	tx transactionQueries, sessionID string,
 ) error {
+	searchContentDelete := func(table string) []string {
+		return []string{`INSERT INTO ` + table + `(` + table + `, rowid, rendered, content)
+			 SELECT 'delete', id, rendered, content FROM message_search_content WHERE session_id = ?`}
+	}
 	tables := []struct {
 		name       string
 		deleteName string
 		deleteDDL  string
+		bulkDelete []string
 	}{
-		{"messages_fts", "messages_ad", messagesADTriggerDDL},
-		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL},
+		{"messages_fts", "messages_ad", messagesADTriggerDDL, searchContentDelete("messages_fts")},
+		{"messages_cjk_fts", "messages_cjk_ad", messagesCJKADTriggerDDL, searchContentDelete("messages_cjk_fts")},
+		{"message_trigram_fts", "messages_trigram_ad", messagesTrigramADTriggerDDL, substringIndexBulkDeleteSQL},
 	}
 	active := tables[:0]
 	for _, table := range tables {
@@ -2407,12 +2429,10 @@ func deleteSessionMessageRowsTx(
 	for _, table := range active {
 		// Bulk-delete the FTS entries first so the later row delete
 		// does not re-tokenize large message blobs through delete triggers.
-		if _, err := tx.Exec(
-			`INSERT INTO `+table.name+`(`+table.name+`, rowid, rendered, content)
-			 SELECT 'delete', id, rendered, content FROM message_search_content WHERE session_id = ?`,
-			sessionID,
-		); err != nil {
-			return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
+		for _, stmt := range table.bulkDelete {
+			if _, err := tx.Exec(stmt, sessionID); err != nil {
+				return fmt.Errorf("bulk-deleting %s entries: %w", table.name, err)
+			}
 		}
 		if _, err := tx.Exec(
 			"DROP TRIGGER IF EXISTS " + table.deleteName,
@@ -2527,7 +2547,9 @@ func (db *DB) replaceSessionContent(ctx context.Context,
 	msgs, _ = db.ProjectToolResultImagesWithPolicy(msgs, policy)
 	if len(msgs) > 0 {
 		msgs = append([]Message(nil), msgs...)
-		_ = ValidateAndSanitize(nil, msgs, nil)
+		if _, err := ValidateAndSanitizeContext(ctx, nil, msgs, nil); err != nil {
+			return err
+		}
 	}
 	rawMessages := msgs
 	msgs = db.messagesForStorage(msgs)
@@ -2546,7 +2568,7 @@ func (db *DB) replaceSessionContent(ctx context.Context,
 	// Same diff-vs-full decision as ReplaceSessionMessages: this is
 	// the hot path for streaming chunk-merge full-parse fallbacks.
 	plan, stored, useDiff, storedLoaded := db.planStoredMessageDiff(
-		sessionID, msgs,
+		ctx, sessionID, msgs,
 	)
 	transcriptChanged := !storedLoaded ||
 		!transcriptMessagesEqual(stored, msgs)
@@ -2594,7 +2616,7 @@ func (db *DB) replaceSessionContent(ctx context.Context,
 	}
 	if !useDiff || len(plan.updates) > 0 {
 		if err := reconcileRecallEvidenceForSessionTx(
-			context.Background(), tx, sessionID, &pendingRecallRevocations,
+			ctx, tx, sessionID, &pendingRecallRevocations,
 		); err != nil {
 			return err
 		}
@@ -3155,7 +3177,7 @@ func attachToolCallsWithQuerier(
 	for i := 0; i < len(ids); i += attachToolCallBatchSize {
 		end := min(i+attachToolCallBatchSize, len(ids))
 		if err := attachToolCallsBatch(
-			ctx, q, msgs, idToIdx, ids[i:end],
+			ctx, q, msgs, idToIdx, ids[i:end], true,
 		); err != nil {
 			return err
 		}
@@ -3175,6 +3197,7 @@ func attachToolCallsBatch(
 	msgs []Message,
 	idToIdx map[int64]int,
 	batch []int64,
+	includeResults bool,
 ) error {
 	if len(batch) == 0 {
 		return nil
@@ -3187,15 +3210,19 @@ func attachToolCallsBatch(
 		placeholders[i] = "?"
 	}
 
+	resultColumn := "NULL"
+	if includeResults {
+		resultColumn = "result_content"
+	}
 	query := fmt.Sprintf(`
 		SELECT message_id, session_id, tool_name, category,
 			tool_use_id, input_json, skill_name,
-			result_content_length, result_content, subagent_session_id,
+			result_content_length, %s, subagent_session_id,
 			file_path, call_index, observed_outcome, observed_repeat, sequence_ending
 		FROM tool_calls
 		WHERE message_id IN (%s)
 		ORDER BY message_id, call_index`,
-		strings.Join(placeholders, ","))
+		resultColumn, strings.Join(placeholders, ","))
 
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -3364,9 +3391,10 @@ func scanMessages(rows MessageRows) ([]Message, error) {
 	for rows.Next() {
 		var m Message
 		var tokenUsage string
+		var dialogueIsContent bool
 		err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-			&m.Content, &m.ThinkingText, &m.DialogueText, &m.Timestamp,
+			&m.Content, &m.ThinkingText, &m.DialogueText, &dialogueIsContent, &m.Timestamp,
 			&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 			&m.IsSystem,
 			&m.Model, &m.ReasoningEffort, &tokenUsage,
@@ -3380,6 +3408,7 @@ func scanMessages(rows MessageRows) ([]Message, error) {
 		if err != nil {
 			return nil, fmt.Errorf("scanning message: %w", err)
 		}
+		restoreDialogue(&m, dialogueIsContent)
 		m.TokenUsage = DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
@@ -4244,9 +4273,10 @@ func (db *DB) GetMessageByOrdinal(ctx context.Context,
 
 	var m Message
 	var tokenUsage string
+	var dialogueIsContent bool
 	err := row.Scan(
 		&m.ID, &m.SessionID, &m.Ordinal, &m.Role,
-		&m.Content, &m.ThinkingText, &m.DialogueText, &m.Timestamp,
+		&m.Content, &m.ThinkingText, &m.DialogueText, &dialogueIsContent, &m.Timestamp,
 		&m.HasThinking, &m.HasToolUse, &m.ContentLength,
 		&m.IsSystem,
 		&m.Model, &m.ReasoningEffort, &tokenUsage,
@@ -4263,6 +4293,7 @@ func (db *DB) GetMessageByOrdinal(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	restoreDialogue(&m, dialogueIsContent)
 	m.TokenUsage = DecodeStoredTokenUsage(tokenUsage)
 	return &m, nil
 }

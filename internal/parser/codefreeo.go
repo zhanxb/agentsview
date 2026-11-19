@@ -12,8 +12,8 @@ import (
 // parsing run through the shared OpenCode-format provider
 // (openCodeProviderSpecForAgent); the helpers below adapt the shared SQLite
 // metadata reader, source mtime, and session relabeling to CodeFree-O.
-func ListCodeFreeOSessionMeta(dbPath string) ([]OpenCodeSessionMeta, error) {
-	metas, err := ListOpenCodeSessionMeta(dbPath)
+func ListCodeFreeOSessionMeta(ctx context.Context, dbPath string) ([]OpenCodeSessionMeta, error) {
+	metas, err := ListOpenCodeSessionMeta(ctx, dbPath)
 	if err != nil {
 		return nil, err
 	}

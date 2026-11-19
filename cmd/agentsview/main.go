@@ -31,6 +31,7 @@ import (
 	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/poller"
+	"go.kenn.io/agentsview/internal/power"
 	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
@@ -57,9 +58,7 @@ const (
 	telemetryDailyCheckInterval    = time.Hour
 	unwatchedPollInterval          = 2 * time.Minute
 	watcherBatchDelay              = 500 * time.Millisecond
-	watcherSyncMinInterval         = 5 * time.Second
 	deferredStartupSyncGracePeriod = 30 * time.Second
-	recursiveWatchBudget           = 8192
 )
 
 const (
@@ -93,7 +92,7 @@ func main() {
 // reported it, and returns the process exit code.
 func reportCLIError(err error, stderr io.Writer) int {
 	if !isSilentExitError(err) {
-		fmt.Fprintf(stderr, "fatal: %v\n", err)
+		writeCLIDiagnostic(stderr, err)
 	}
 	return exitCodeFromError(err)
 }
@@ -131,20 +130,17 @@ type serveOptions struct {
 	BasePath        string
 	Pprof           bool
 	// ReloadConfig rebuilds the configuration with the same layers and flags
-	// as startup so saved provider settings apply without a restart. Nil
-	// leaves the startup provider set in place until the daemon restarts.
+	// as startup so saved provider settings apply without a restart.
 	ReloadConfig func() (config.Config, error)
 }
 
 // serveMemoryLimitBytes is the default Go soft memory limit for the
-// long-running serve daemon. Full parses of multi-megabyte transcripts
-// otherwise balloon the heap to several hundred megabytes; the pages
-// are freed afterwards but macOS keeps them in the process RSS
-// indefinitely, so the daemon's reported memory ratchets to the
-// largest transient since startup. A soft limit makes the GC hold the
-// heap near the cap during those bursts instead. CGO memory (SQLite)
-// is outside the limit, so total RSS settles somewhat above it.
-const serveMemoryLimitBytes = 256 << 20
+// long-running serve daemon. It provides a backstop well above
+// the live heap of concurrent large analytics requests, about 350 MB each
+// on a 30k-session archive, so normal GC pacing runs during them. A lower
+// limit made those requests collect back to back. SQLite memory allocated
+// through cgo sits outside the limit.
+const serveMemoryLimitBytes = 4 << 30
 
 // applyServeMemoryLimit installs the default soft memory limit unless
 // the operator already set one via GOMEMLIMIT. Only the serve daemon
@@ -159,6 +155,7 @@ func applyServeMemoryLimit() {
 }
 
 func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restartPort int) {
+	cfg.PersistentDaemon = !runningAsBackgroundChild() || os.Getenv(persistentDaemonEnvVar) == "true"
 	setupDebugLogWriter(cfg.DataDir)
 	archiveOnly, err := archiveModeAfterRecovery(ctx, cfg)
 	if err != nil {
@@ -169,7 +166,6 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	}
 	start := time.Now()
 	applyServeMemoryLimit()
-	applyServeMallocTuning()
 
 	if err := validateServeConfig(cfg); err != nil {
 		fatal("invalid serve config: %v", err)
@@ -179,7 +175,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	// general API auth is disabled. Ensure a token exists before publishing
 	// startup state so daemon probes and remote collectors share one token.
 	if err := ensureServeAuthToken(&cfg); err != nil {
-		log.Fatalf("Failed to generate auth token: %v", err)
+		fatal("Failed to generate auth token: %v", withCLIHint(err, "check write permissions for AGENTSVIEW_DATA_DIR and the configured auth token file; run `agentsview serve --help`"))
 	}
 	if cfg.RequireAuth {
 		// Startup output may be captured by service managers or log files,
@@ -211,6 +207,8 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	MarkDaemonStarting(cfg.DataDir)
 	defer UnmarkDaemonStarting(cfg.DataDir)
 	startupProgress := newStartupStateWriter(cfg.DataDir, time.Now)
+	startupProgress.state.Persistent = cfg.PersistentDaemon
+	startupProgress.state.IdleTimeout = effectiveDaemonIdleTimeout(cfg).String()
 
 	// The signal context is created before the startup worker so SIGTERM can
 	// interrupt the worker pass. The server is fully drained by
@@ -337,33 +335,32 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 
 	broadcaster := server.NewBroadcaster(cfg.EventsCoalesceInterval)
 
-	vectorServe, err := setupVectorServing(ctx, cfg, database, idleTracker)
+	vectorServe, err := newLiveVectorServing(ctx, cfg, database, idleTracker, opts.ReloadConfig)
 	if err != nil {
 		fatal("setting up vector index: %v", err)
 	}
-	if vectorServe.Close != nil {
-		defer func() {
-			if cerr := vectorServe.Close(); cerr != nil {
-				log.Printf("close vectors.db: %v", cerr)
-			}
-		}()
-	}
+	defer func() {
+		if cerr := vectorServe.Close(); cerr != nil {
+			log.Printf("close vectors.db: %v", cerr)
+		}
+	}()
 
-	emitter := wrapEmbeddingSyncEmitter(
-		broadcaster, vectorServe, cfg.Vector.Embed.RunAfterSyncEnabled(),
-	)
+	emitter := wrapEmbeddingSyncEmitter(broadcaster, vectorServe.Notify)
 
-	extractSched, err := setupRecallExtraction(cfg, database, idleTracker)
+	extractSched, err := setupRecallExtraction(ctx, cfg, database, idleTracker)
 	if err != nil {
 		fatal("setting up recall extraction: %v", err)
 	}
 	if extractSched != nil {
-		if vectorServe.RecallMutationNotify != nil {
-			extractSched.onPassFinished = vectorServe.RecallMutationNotify
+		if cfg.Recall.Extract.Enabled {
+			extractSched.onBattery = power.OnBattery
+			extractSched.onBatteryMgr = extract.NewReconciler(database)
 		}
+		extractSched.onPassFinished = func() { vectorServe.Notify(true) }
 		emitter = extractTeeEmitter{primary: emitter, scheduler: extractSched}
 	}
 
+	var ingestion *daemonIngestion
 	var frictionReviews *frictionReviewer
 	if cfg.Friction.Enabled {
 		frictionReviews = newFrictionReviewer()
@@ -377,6 +374,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	var memoryRefresh *memoryRefreshQueue
 	if !cfg.NoSync {
 		var onStartupReconciled func(sync.SyncStats, error)
+		var queueRebuildRetry func(sync.WatchBatch)
 		engine = sync.NewEngine(ctx, database, sync.EngineConfig{
 			AgentDirs: cfg.AgentDirs,
 			RebuildSources: func(ctx context.Context) (sync.RebuildOptions, error) {
@@ -398,6 +396,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			OnStartupReconciled: func(stats sync.SyncStats, err error) {
 				onStartupReconciled(stats, err)
 			},
+			OnRebuildDeferred: func(batch sync.WatchBatch) { queueRebuildRetry(batch) },
 		})
 		defer engine.Close()
 		if frictionReviews != nil {
@@ -407,9 +406,10 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			// archive that has just enabled the setting.
 			frictionReviews.Notify()
 		}
-		ingestion := newDaemonIngestion(
+		ingestion = newDaemonIngestion(
 			ctx, cfg, engine, database, idleTracker, opts.ReloadConfig,
 		)
+		queueRebuildRetry = ingestion.QueueWatchRetry
 		defer ingestion.Stop()
 		if opts.ReloadConfig != nil {
 			reloadIngestion = ingestion.Reload
@@ -418,13 +418,14 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		if err != nil {
 			fatal("configuring archive sources: %v", err)
 		}
+		ingestion.attached = attachedSources
 		defer attachedSources.Close()
 		acknowledgeStartup := newStartupReconciliationHandler(
 			ctx, database.CheckpointWALTruncateWithRetry, ingestion.OpenWatcherDispatch,
 		)
 		onStartupReconciled = func(stats sync.SyncStats, err error) {
 			acknowledgeStartup(stats, err)
-			if err == nil && stats.ProcessingComplete() && !database.NeedsResync() {
+			if err == nil && stats.ProcessingCompleteOrRetrying() && !database.NeedsResync() {
 				go idleTracker.Do(func() {
 					if _, err := attachedSources.Drain(ctx, nil); err != nil && ctx.Err() == nil {
 						log.Printf("archive sources: %v", err)
@@ -504,8 +505,11 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			validRemotes = false
 		}
 		ingestion.StartLiveActivity()
+		if idleTracker != nil {
+			idleTracker.SetSyncIdle(cfg.SyncIdleAfter, ingestion.Suspend)
+		}
 		go startPeriodicSync(
-			ctx, cfg, ingestion.Config, engine, database, writeLock, idleTracker,
+			ctx, cfg, ingestion, engine, database, writeLock, idleTracker,
 			validRemotes, emitter, attachedSources,
 		)
 		memoryRefresh = newMemoryRefreshQueue()
@@ -563,7 +567,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	if engine != nil {
 		pricingRefreshRunner = engine
 	}
-	seedPricing(database, pricingRefreshRunner)
+	seedPricing(ctx, database, pricingRefreshRunner)
 	codexCloudStatus := codexcloud.NewStatusBoard()
 	codexCloudSync := newCodexCloudSyncer(cfg, config.LoadReadOnly, codexCloudStatus)
 	codexCloudTrigger := &codexCloudTrigger{}
@@ -603,6 +607,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		server.WithBaseContext(ctx),
 		server.WithBroadcaster(broadcaster),
 		server.WithIdleTracker(idleTracker),
+		server.WithDaemonPersistence(func() error { return publishPersistentDaemon(cfg.DataDir) }),
 		server.WithHTTPRemoteCleanupRegistry(httpRemoteCleanupRegistry),
 		server.WithPprof(opts.Pprof),
 		server.WithTelemetryCapture(telemetryCapture),
@@ -611,9 +616,8 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		srvOpts = append(srvOpts, server.WithBasePath(rtOpts.BasePath))
 	}
 	srvOpts = append(srvOpts, pushBackendOptions()...)
-	srvOpts = append(srvOpts, vectorServe.ServerOpts...)
-	if src := newVectorPushSource(cfg); src != nil {
-		srvOpts = append(srvOpts, server.WithVectorPushSource(src))
+	if !cfg.ArchiveContent.UsageOnly() && !database.ArchiveContent().UsageOnly() {
+		srvOpts = append(srvOpts, vectorServe.ServerOptions()...)
 	}
 	if extractSched != nil {
 		// Trash, restore, and permanent-delete routes change extraction
@@ -629,10 +633,10 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	if engine != nil {
 		srvOpts = append(srvOpts, server.WithArchiveSources(attachedSources))
 		srvOpts = append(srvOpts, server.WithLocalSyncRunner(
-			withAttachedSources(attachedSources, newForegroundSyncRunner(ctx, cfg, engine, database, writeLock)),
+			ingestion.foregroundSync(withAttachedSources(attachedSources, newForegroundSyncRunner(ctx, cfg, engine, database, writeLock))),
 		))
 		srvOpts = append(srvOpts, server.WithLocalResyncRunner(
-			server.LocalResyncRunner(withAttachedSources(attachedSources, server.LocalSyncRunner(newForegroundResyncRunner(ctx, cfg, engine, database)))),
+			server.LocalResyncRunner(ingestion.foregroundSync(withAttachedSources(attachedSources, server.LocalSyncRunner(newForegroundResyncRunner(ctx, cfg, engine, database))))),
 		))
 	}
 	if memoryRefresh != nil {
@@ -650,6 +654,9 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
 	))
+	if ingestion != nil {
+		srvOpts = append(srvOpts, server.WithIngestionFreshness(ingestion))
+	}
 	srv := server.New(cfg, database, engine, srvOpts...)
 	waitFriction := startLocalFrictionReview(ctx, cfg, database, srv, idleTracker)
 	defer func() {
@@ -669,7 +676,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		}
 		go func() {
 			defer close(auditDone)
-			startArchiveAudit(auditCtx, cfg, engine, database, writeLock, idleTracker, emitter, startupReady)
+			startArchiveAudit(auditCtx, cfg, engine, database, writeLock, idleTracker, emitter, startupReady, ingestion, power.OnBattery)
 		}()
 		if startupRebuild {
 			select {
@@ -702,6 +709,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		explicitPort = new(rtOpts.RequestedPort)
 	}
 	if _, sfErr := writeDaemonRuntimeWithAuthAndNoSync(
+		&daemonLifetime{Persistent: rt.Cfg.PersistentDaemon, IdleTimeout: effectiveDaemonIdleTimeout(rt.Cfg)},
 		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, rt.PublicURL, false,
 		rt.Cfg.RequireAuth, rt.Cfg.NoSync, explicitPort,
 		rt.Caddy.Pid(),
@@ -754,18 +762,6 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 
 	startTelemetryPings(ctx, telemetryReporter, cfg)
 	defer startSetupTelemetry(ctx, telemetryReporter, cfg, database, broadcaster)()
-
-	if vectorServe.Scheduler != nil {
-		go vectorServe.Scheduler.Run(ctx)
-		// Registered after the vectors.db Close defer above, so LIFO
-		// unwind order runs Stop (which waits for any in-flight
-		// TryBuild to return) before vectors.db is closed.
-		defer vectorServe.Scheduler.Stop()
-	}
-	if vectorServe.RecallScheduler != nil {
-		go vectorServe.RecallScheduler.Run(ctx)
-		defer vectorServe.RecallScheduler.Stop()
-	}
 
 	if extractSched != nil {
 		go extractSched.Run(ctx)
@@ -989,6 +985,7 @@ func deferStartupMaintenance(skipInitialSync, workerSyncDone bool) bool {
 func statsFromWorkerResult(r workerResult) sync.SyncStats {
 	if r.Stats != nil {
 		stats := *r.Stats
+		stats.SetDeferredRetryBatch(r.Deferred, r.DeferredRetry)
 		if r.Tombstoned > stats.Tombstoned {
 			stats.Tombstoned = r.Tombstoned
 		}
@@ -1363,7 +1360,7 @@ func runWorkerResyncBuild(
 			}
 			return launchErr
 		}
-		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		installed, serr := engine.SwapResyncDatabase(recoveryCtx, engine.ResyncTempPath())
 		if installed {
 			doneStats = statsFromWorkerResult(result)
 			doneStats.ArchiveRebuilt = true
@@ -1413,6 +1410,10 @@ func runWorkerResyncBuild(
 		return nil
 	})
 	if doneStats.ArchiveRebuilt {
+		// Only the parent knows the replacement was installed. Return that
+		// fact to foreground callers as well as notifying the watcher.
+		result.Stats = &doneStats
+		engine.NotifyRebuildDeferred(doneStats)
 		engine.FinishStartupReconciled(doneStats)
 	} else if startup {
 		engine.RecordStartupReconciled(statsFromWorkerResult(result), barrierErr)
@@ -1460,12 +1461,15 @@ func ensureServeAuthToken(cfg *config.Config) error {
 	return cfg.EnsureAuthToken()
 }
 
-func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
-	if !runningAsBackgroundChild() {
-		return nil
+func effectiveDaemonIdleTimeout(cfg config.Config) time.Duration {
+	if cfg.PersistentDaemon {
+		return 0
 	}
-	timeout := cfg.DaemonIdleTimeout
-	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); raw != "" {
+	timeout := time.Duration(0)
+	if runningAsBackgroundChild() {
+		timeout = cfg.DaemonIdleTimeout
+	}
+	if raw := os.Getenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT"); runningAsBackgroundChild() && raw != "" {
 		parsed, err := time.ParseDuration(raw)
 		if err != nil {
 			log.Printf(
@@ -1476,7 +1480,12 @@ func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.Id
 			timeout = parsed
 		}
 	}
-	if timeout <= 0 {
+	return max(timeout, 0)
+}
+
+func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.IdleTracker {
+	timeout := effectiveDaemonIdleTimeout(cfg)
+	if timeout <= 0 && (cfg.NoSync || cfg.SyncIdleAfter <= 0) {
 		return nil
 	}
 	return server.NewIdleTracker(timeout, func() {
@@ -1573,10 +1582,10 @@ func runDailyTelemetryPings(ctx context.Context, interval time.Duration, cfg con
 func mustLoadConfig(cmd *cobra.Command) config.Config {
 	cfg, err := config.LoadPFlags(cmd.Flags())
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		fatal("loading config: %v", withCLIHint(err, configRecoveryHint))
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		log.Fatalf("creating data dir: %v", err)
+		fatal("creating data dir: %v", withCLIHint(err, "check write permissions for AGENTSVIEW_DATA_DIR, or select a writable directory with that variable"))
 	}
 	return cfg
 }
@@ -1786,7 +1795,7 @@ func staleClientUpgradeHint() string {
 		"install and rerun the command. If this command is a " +
 		"long-running background process started before the upgrade " +
 		"(`pg push --watch`, `duckdb push --watch`, or a service " +
-		"installed with `agentsview pg service`), restart it so it " +
+		"installed with `agentsview replica pg service`), restart it so it " +
 		"picks up the current binary."
 }
 
@@ -1950,8 +1959,19 @@ func applyRequiredCursorSecret(database cursorSecretStore, cfg config.Config) er
 // Use instead of log.Fatalf after setupLogFile redirects
 // log output to the debug log file.
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "fatal: "+format+"\n", args...)
-	os.Exit(1)
+	message := fmt.Sprintf(format, args...)
+	cause := errors.New(message)
+	for _, arg := range args {
+		if err, ok := arg.(error); ok {
+			cause = err
+			break
+		}
+	}
+	err := processCLIError(cause)
+	if diagnostic, ok := errors.AsType[*cliDiagnosticError](err); ok && diagnostic.display == "" {
+		diagnostic.display = message
+	}
+	os.Exit(reportCLIError(withExitCode(err, 1), os.Stderr))
 }
 
 // cleanResyncTemp removes leftover temp database files from
@@ -1988,7 +2008,7 @@ func noSyncRebuildNotice(noSync, archiveOnly, needsResync bool) string {
 	return "The archive needs a full rebuild for this version, and --no-sync " +
 		"skips it at startup. Until it runs, sessions that need the new " +
 		"parsers stay missing. Click Sync in the web UI or run " +
-		"`agentsview sync` to rebuild it."
+		"`agentsview source sync` to rebuild it."
 }
 
 // runInitialResync runs ResyncAll, falling back to incremental
@@ -2394,7 +2414,7 @@ func startFileWatcher(
 	roots, unwatchedDirs, symlinkGatedDirs, persistentDirAgents := collectWatchRoots(cfg)
 	watcher, err := sync.NewWatcherWithCallback(
 		watcherBatchDelay,
-		watcherSyncMinInterval,
+		cfg.SyncInterval,
 		onChange,
 		cfg.WatchExcludePatterns,
 		options,
@@ -3181,7 +3201,7 @@ func collectLegacyWatchRoots(
 func startPeriodicSync(
 	ctx context.Context,
 	cfg config.Config,
-	sourceConfig func() config.Config,
+	ingestion *daemonIngestion,
 	engine *sync.Engine,
 	database *db.DB,
 	lock *writeOwnerLock,
@@ -3208,18 +3228,22 @@ func startPeriodicSync(
 			return
 		case <-ticker.C:
 		}
+		if !ingestion.Active() {
+			continue
+		}
 		log.Println("Running scheduled reconciliation...")
 		idleTracker.Do(func() {
 			// Roots follow provider settings changes, and the scheduled
 			// reconcile targets are re-probed each tick because disk
 			// availability changes.
-			current := sourceConfig()
+			current := ingestion.Config()
 			runScheduledSyncPass(ctx, engine, scheduledReconcileTargets(current))
 			runRemoteSourceSyncPass(ctx, engine, remoteSourceSyncRoots(current))
 			if _, err := attachedSources.DrainScheduled(ctx); err != nil && ctx.Err() == nil {
 				log.Printf("archive sources: %v", err)
 			}
-			recomputePendingSessions(engine, database)
+			recomputePendingSessions(ctx, engine, database)
+			engine.ReconcileCommitTrailers(ctx)
 			recomputeStaleFriction(ctx, engine)
 		})
 	}
@@ -3236,6 +3260,8 @@ func startArchiveAudit(
 	idleTracker *server.IdleTracker,
 	emitter sync.Emitter,
 	startupReady chan struct{},
+	ingestion *daemonIngestion,
+	onBattery func() bool,
 ) {
 	first := archiveAuditInterval
 	if database.NeedsResync() {
@@ -3250,11 +3276,20 @@ func startArchiveAudit(
 		func(ctx context.Context, delay time.Duration) bool {
 			timer := time.NewTimer(delay)
 			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return false
-			case <-timer.C:
-				return true
+			for {
+				select {
+				case <-ctx.Done():
+					return false
+				case <-timer.C:
+					if ingestion != nil && !ingestion.Active() {
+						timer.Reset(batteryRecheckInterval)
+						continue
+					}
+					if startupReady != nil || database.NeedsResync() || onBattery == nil || !onBattery() {
+						return true
+					}
+					timer.Reset(batteryRecheckInterval)
+				}
 			}
 		},
 		func(ctx context.Context) bool {
@@ -3587,12 +3622,12 @@ func runRemoteHostSyncLoop(
 }
 
 func recomputePendingSessions(
-	engine *sync.Engine, database *db.DB,
+	ctx context.Context, engine *sync.Engine, database *db.DB,
 ) {
 	cutoff := time.Now().Add(-signals.RecencyWindow).
 		UTC().Format(time.RFC3339)
 	ids, err := database.PendingSignalSessions(
-		context.Background(), cutoff,
+		ctx, cutoff,
 	)
 	if err != nil {
 		log.Printf("deferred recompute query: %v", err)
@@ -3606,10 +3641,13 @@ func recomputePendingSessions(
 		len(ids),
 	)
 	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
 		// Errors are already logged by RecomputeSignals; the
 		// deferred-recompute loop is best-effort, the next
 		// pass will retry any that failed.
-		_ = engine.RecomputeSignals(context.Background(), id)
+		_ = engine.RecomputeSignals(ctx, id)
 	}
 }
 

@@ -63,6 +63,9 @@ Add to your MCP client config (e.g. Claude Desktop):
       }
     }
   }`,
+		Example: "  agentsview mcp\n" +
+			"  agentsview mcp --profile memory\n" +
+			"  agentsview mcp status",
 		GroupID:      groupData,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
@@ -248,7 +251,7 @@ func resolveMCPService(
 		if err := cfg.ApplyDeploymentEmbeddings(); err != nil {
 			return nil, nil, fmt.Errorf("loading deployment embeddings: %w", err)
 		}
-		return newPGReadService(cfg, pgCfg)
+		return newPGReadService(cmd.Context(), cfg, pgCfg)
 	}
 	if err := cfg.ApplyDeploymentAuth(); err != nil {
 		return nil, nil, fmt.Errorf("loading daemon auth: %w", err)
@@ -271,6 +274,24 @@ type mcpDaemonSelection struct {
 
 func newMCPDaemonService(cfg config.Config) service.SessionService {
 	return &mcpDaemonService{cfg: cfg}
+}
+
+func (s *mcpDaemonService) SupportsFileReferences() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return servingDocbankEnabled(s.cfg)
+}
+
+// servingDocbankEnabled answers from the daemon that serves MCP calls. Without
+// one, the daemon MCP will start reads the same config.
+func servingDocbankEnabled(cfg config.Config) bool {
+	runtime := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken)
+	if runtime == nil {
+		return cfg.Integrations.Docbank.Enabled()
+	}
+	base := urlFromDaemonRuntime(runtime)
+	capabilities, err := servicehttp.ProbeHTTPServerCapabilities(context.Background(), base, cfg.AuthToken)
+	return err == nil && service.SupportsFileReferences(servicehttp.NewHTTPBackendForServer(base, cfg.AuthToken, capabilities))
 }
 
 func (s *mcpDaemonService) SupportsRecallQueries() bool {
@@ -717,4 +738,18 @@ func normalizeMCPHTTPAddr(addr string, allowInsecure bool) (string, error) {
 				"an authenticating reverse proxy)", trimmed)
 	}
 	return trimmed, nil
+}
+
+func (s *mcpDaemonService) SessionCommits(ctx context.Context, id string) (*db.SessionCommitList, error) {
+	return mcpDaemonCall(ctx, s, func(svc service.SessionService) (*db.SessionCommitList, error) { return svc.SessionCommits(ctx, id) })
+}
+
+func (s *mcpDaemonService) CommitSessions(ctx context.Context, shas []string) (*db.CommitSessionList, error) {
+	return mcpDaemonCall(ctx, s, func(svc service.SessionService) (*db.CommitSessionList, error) { return svc.CommitSessions(ctx, shas) })
+}
+
+func (s *mcpDaemonService) FileReferences(ctx context.Context, id string) (service.FileReferencesResult, error) {
+	return mcpDaemonCall(ctx, s, func(svc service.SessionService) (service.FileReferencesResult, error) {
+		return service.FileReferences(ctx, svc, id)
+	})
 }

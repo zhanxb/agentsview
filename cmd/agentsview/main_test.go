@@ -226,17 +226,25 @@ func TestRuntimeWarningHelper(t *testing.T) {
 }
 
 func TestServeRuntimeRecordWriteFailureWarnsVisibleAfterStartupRelease(t *testing.T) {
-	out, err := runServeRuntimeWarningHelper(t, true)
+	out, err := runServeRuntimeWarningHelper(t, true, false)
 	require.NoError(t, err, string(out))
 	assert.Contains(t, string(out), "could not write daemon runtime record")
 	assert.Contains(t, string(out), "icacls <dir> /setowner <user>")
 }
 
-func TestServeRuntimeRecordWriteSuccessDoesNotWarnVisible(t *testing.T) {
-	out, err := runServeRuntimeWarningHelper(t, false)
-	require.NoError(t, err, string(out))
-	assert.Contains(t, string(out), "runtime record write reached")
-	assert.NotContains(t, string(out), "could not write daemon runtime record")
+func TestServePublishesStartupLifetime(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		background bool
+		want       string
+	}{{"foreground", false, "startup lifetime: true 0s"}, {"automatic background", true, "startup lifetime: false 2s"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runServeRuntimeWarningHelper(t, false, tc.background)
+			require.NoError(t, err, string(out))
+			assert.Contains(t, string(out), tc.want)
+			assert.NotContains(t, string(out), "could not write daemon runtime record")
+		})
+	}
 }
 
 func TestServeCommandMountsWritableServerAtBasePath(t *testing.T) {
@@ -331,7 +339,7 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 		})
 	}
 	original := writeDaemonRuntimeWithAuthAndNoSync
-	writeDaemonRuntimeWithAuthAndNoSync = func(dataDir, host string, port int, version, browserURL string, readOnly, requireAuth, noSync bool, explicitPort *int, caddyPID ...int) (string, error) {
+	writeDaemonRuntimeWithAuthAndNoSync = func(lifetime *daemonLifetime, dataDir, host string, port int, version, browserURL string, readOnly, requireAuth, noSync bool, explicitPort *int, caddyPID ...int) (string, error) {
 		base := fmt.Sprintf("http://%s:%d", host, port)
 		client := &http.Client{Timeout: 10 * time.Second, Transport: localTransport}
 		if kind != "" {
@@ -391,7 +399,7 @@ func TestServeStaleArchiveHelperProcess(t *testing.T) {
 			require.Contains(t, string(body), "hello")
 		}
 		fmt.Println("archive rebuild complete")
-		return original(dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort, caddyPID...)
+		return original(lifetime, dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort, caddyPID...)
 	}
 	runServe(t.Context(), cfg, serveOptions{SkipInitialSync: true}, 0)
 }
@@ -403,10 +411,14 @@ func TestPGServeRuntimeRecordWriteFailureWarnsVisible(t *testing.T) {
 }
 
 func runServeRuntimeWarningHelper(
-	t *testing.T, failWrite bool,
+	t *testing.T, failWrite, background bool,
 ) ([]byte, error) {
 	t.Helper()
 	dataDir := t.TempDir()
+	child := ""
+	if background {
+		child = "1"
+	}
 	marker := "runtime record write reached"
 	if failWrite {
 		// Wait for the remedy, which is emitted after the warning, so the parent
@@ -419,6 +431,9 @@ func runServeRuntimeWarningHelper(
 			"AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_HELPER=1",
 			"AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_FAIL=" + strconv.FormatBool(failWrite),
 			"AGENTSVIEW_DATA_DIR=" + dataDir,
+			backgroundChildEnvVar + "=" + child,
+			persistentDaemonEnvVar + "=false",
+			"AGENTSVIEW_DAEMON_IDLE_TIMEOUT=2s",
 		},
 		marker,
 	)
@@ -524,6 +539,7 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	}
 	if os.Getenv("AGENTSVIEW_RUN_SERVE_RUNTIME_WARNING_FAIL") == "true" {
 		writeDaemonRuntimeWithAuthAndNoSync = func(
+			*daemonLifetime,
 			string, string, int, string, string, bool, bool, bool, *int, ...int,
 		) (string, error) {
 			return "", errors.New("forced runtime-record write failure")
@@ -531,11 +547,15 @@ func TestRunServeRuntimeWarningHelperProcess(t *testing.T) {
 	} else {
 		original := writeDaemonRuntimeWithAuthAndNoSync
 		writeDaemonRuntimeWithAuthAndNoSync = func(
+			lifetime *daemonLifetime,
 			dataDir, host string, port int, version, browserURL string, readOnly,
 			requireAuth, noSync bool, explicitPort *int, caddyPID ...int,
 		) (string, error) {
+			if snapshot := readStartupState(dataDir); snapshot != nil {
+				fmt.Printf("startup lifetime: %t %s\n", snapshot.Persistent, snapshot.IdleTimeout)
+			}
 			path, err := original(
-				dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort,
+				lifetime, dataDir, host, port, version, browserURL, readOnly, requireAuth, noSync, explicitPort,
 				caddyPID...,
 			)
 			if os.Getenv("AGENTSVIEW_RUN_SERVE_BASE_PATH") != "" {
@@ -611,7 +631,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 		Port:    port,
 		DataDir: os.Getenv("AGENTSVIEW_DATA_DIR"),
 	}
-	prepareReplicaServe = func(storage.Replica, config.Config, string, *ReplicaPushConfig) (replicaServeStartup, error) {
+	prepareReplicaServe = func(context.Context, storage.Replica, config.Config, string, *ReplicaPushConfig) (replicaServeStartup, error) {
 		return replicaServeStartup{
 			cfg: appCfg, ctx: ctx,
 			rtOpts: serveRuntimeOptions{
@@ -627,7 +647,7 @@ func TestRunPGRuntimeWarningHelperProcess(t *testing.T) {
 	// This is only an orphan guard if the parent dies; normal completion is
 	// driven by the parent observing the warning on stdout.
 	time.AfterFunc(2*time.Minute, func() { os.Exit(0) })
-	runReplicaServe(pgReplica{}, appCfg, "", nil)
+	runReplicaServe(t.Context(), pgReplica{}, appCfg, "", nil)
 }
 
 func TestMustLoadConfig(t *testing.T) {
@@ -1006,6 +1026,34 @@ func TestPollUnwatchedScopesOnceUsesScopedAuthoritativeReconciliation(t *testing
 	require.Equal(t, 2, fake.calls)
 	assert.Equal(t, roots, fake.callRoots[0])
 	assert.Equal(t, roots, fake.callRoots[1])
+}
+
+func TestStartFileWatcherUsesSyncInterval(t *testing.T) {
+	projects := filepath.Join(t.TempDir(), "projects")
+	project := filepath.Join(projects, "project-a")
+	require.NoError(t, os.MkdirAll(project, 0o700))
+	cfg := config.Config{
+		SyncInterval: time.Second,
+		AgentDirs:    map[parser.AgentType][]string{parser.AgentClaude: {projects}},
+	}
+	calls := make(chan time.Time, 8)
+	stop, open, unwatched, _, _ := startFileWatcher(cfg, nil,
+		func(context.Context, agentsync.WatchBatch) error {
+			calls <- time.Now()
+			return nil
+		}, agentsync.WatcherOptions{})
+	t.Cleanup(stop)
+	require.Empty(t, unwatched)
+	open()
+	path := filepath.Join(project, "active.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("first\n"), 0o600))
+	first := receiveArchiveTest(t, calls)
+	require.NoError(t, os.WriteFile(path, []byte("second\n"), 0o600))
+	gap := receiveArchiveTest(t, calls).Sub(first)
+	// Callback timestamps follow dispatch; allow scheduling delay before the first timestamp.
+	const dispatchJitter = 250 * time.Millisecond
+	assert.GreaterOrEqual(t, gap, cfg.SyncInterval-dispatchJitter)
+	assert.Less(t, gap, 4*time.Second)
 }
 
 func TestCollectWatchRootsPreservesDirsSharingWatchRoot(t *testing.T) {
@@ -4068,4 +4116,20 @@ func TestNoSyncRebuildNotice(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewDaemonIdleTrackerExplicitLifetime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv(backgroundChildEnvVar, "1")
+		t.Setenv("AGENTSVIEW_DAEMON_IDLE_TIMEOUT", "2s")
+		stopped := false
+		tracker := newDaemonIdleTracker(config.Config{SyncIdleAfter: time.Second, PersistentDaemon: true}, func() { stopped = true })
+		require.NotNil(t, tracker)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go tracker.Run(ctx)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		assert.False(t, stopped)
+	})
 }

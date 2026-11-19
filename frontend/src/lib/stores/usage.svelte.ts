@@ -1,6 +1,6 @@
 import { excludedModelGroups, groupedModelCsv, toggleGroupedModel } from "../utils/model-groups.js";
 import { m } from "../i18n/index.js";
-import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { queryStepFrom, refreshScopeKey, type QueryStep } from "../utils/refresh.js";
 import { LiveQuery } from "../utils/liveQuery.svelte.js";
 import type { UsagePairwiseDimension } from "../api/types/usage.js";
 import {
@@ -218,11 +218,6 @@ function selectionKey(params: UsageParams): string {
   return [params.project_key, params.model, params.agent].join("|");
 }
 
-// active_since follows the clock, so only whether it is set changes the scope.
-function refreshScopeKey(params: UsageParams): string {
-  return JSON.stringify({ ...params, active_since: params.active_since !== undefined });
-}
-
 function summaryForDateRange(
   summary: UsageSummaryResponse,
   from: string,
@@ -372,6 +367,7 @@ class UsageStore {
   excludedAgents: string = $state("");
   excludedModels: string = $state("");
   knownProjects: UsageProjectFilterItem[] = $state([]);
+  knownAgents: Array<{ name: string; count?: number }> = $state([]);
 
   constructor() {
     const saved = loadUsageFilters();
@@ -415,6 +411,8 @@ class UsageStore {
   private zoomRanking = "";
   topSessions = $state<DbTopSessionEntry[] | null>(null);
   lastUpdatedAt: number | null = $state(null);
+  // Monotonic milliseconds shared by query timings and automatic refreshes.
+  lastFetchStartedAt = $state(0);
   // Wall-clock ms of the most recent full refresh, request start to data
   // applied, shown next to the refresh label. null until the first load.
   lastQueryDurationMs: number | null = $state(null);
@@ -422,9 +420,8 @@ class UsageStore {
   lastQuerySteps: QueryStep[] = $state([]);
   // Latest successful timing per panel, collected while a full refresh runs
   // and snapshotted into lastQuerySteps when it completes. Offsets are
-  // relative to refreshStartedAt.
+  // relative to lastFetchStartedAt.
   private stepTimings = new Map<UsageStep, QueryStep>();
-  private refreshStartedAt = 0;
   // The full refresh running now, drawn live by the refresh control.
   readonly liveQuery = new LiveQuery();
   hasNewData: boolean = $state(false);
@@ -468,7 +465,6 @@ class UsageStore {
   }
 
   markNewData(): void {
-    if (this.lastUpdatedAt === null) return;
     this.hasNewData = true;
   }
 
@@ -996,10 +992,12 @@ class UsageStore {
   }
 
   private async fetchAllWithResult(options: FetchAllOptions = {}): Promise<FetchResult> {
+    // A failed read waits for another event or poll; events during this read mark pending again.
+    this.hasNewData = false;
     this.dropExcludedSelection();
     const startedAt = performance.now();
+    this.lastFetchStartedAt = startedAt;
     this.stepTimings.clear();
-    this.refreshStartedAt = startedAt;
     const live = this.liveQuery.begin(startedAt);
     try {
       return await this.fetchAllSteps(startedAt, options);
@@ -1035,6 +1033,7 @@ class UsageStore {
       params,
       contextParams,
     });
+    const comparisonPromise = this.fetchComparison(this.versions.summary, params, summaryPromise);
     void this.fetchPairwise(
       params,
       refreshScopeKey(params) !== this.pairwiseScope || this.pairwiseComparison === null,
@@ -1066,6 +1065,7 @@ class UsageStore {
       }
     }
     if (!loadedSummary) {
+      this.abortPanel("comparison");
       await Promise.all([topSessionsPromise, zoomPromise]);
       if (fetchVersion !== this.fetchAllVersion) return "aborted";
       if (rangeRestored) {
@@ -1092,10 +1092,20 @@ class UsageStore {
           return this.fetchZoom(loadedSummary.params);
         })
       : zoomPromise;
+    const currentComparisonPromise = loadedSummary.projectScopeRecovered
+      ? comparisonPromise.then(() => {
+          if (fetchVersion !== this.fetchAllVersion) return "aborted";
+          return this.fetchComparison(
+            loadedSummary.version,
+            loadedSummary.params,
+            Promise.resolve(loadedSummary),
+          );
+        })
+      : comparisonPromise;
     const [topSessionsResult, loadedZoomResult, comparisonResult] = await Promise.all([
       currentTopSessionsPromise,
       currentZoomPromise,
-      this.fetchComparison(loadedSummary.version, loadedSummary.summary, loadedSummary.params),
+      currentComparisonPromise,
     ]);
     let pairwiseResult = await this.awaitPairwise();
     if (
@@ -1237,7 +1247,7 @@ class UsageStore {
           projectScopeRecovered: false,
         };
         if (loadComparison) {
-          void this.fetchComparison(v, data, params);
+          void this.fetchComparison(v, params, Promise.resolve(loaded));
           void this.fetchPairwise(params, this.pairwiseSelectionUnavailable());
         }
         return loaded;
@@ -1339,8 +1349,8 @@ class UsageStore {
 
   private async fetchComparison(
     summaryVersion: number,
-    summary: UsageSummaryResponse,
     params: UsageParams,
+    summary: Promise<LoadedUsageSummary | null>,
   ): Promise<FetchResult> {
     if (this.versions.summary !== summaryVersion) return "aborted";
     const signal = this.nextAbortSignal("comparison");
@@ -1348,16 +1358,15 @@ class UsageStore {
     const liveStep = this.liveQuery.start("comparison", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
-      const comparison = await UsageService.getApiV1UsageComparison(
-        {
-          ...params,
-          current_microdollars: summary.totals.totalCost.microdollars,
-        },
-        { signal },
-      );
-      if (this.versions.summary === summaryVersion) {
-        this.summary = { ...summary, comparison };
-        this.noteStep("comparison", liveStep, started, comparison);
+      const [comparison, loaded] = await Promise.all([
+        // The card uses the summary total and priorTotalCost for its percentage, so this request needn't wait for Summary.
+        UsageService.getApiV1UsageComparison({ ...params, current_microdollars: 0 }, { signal }),
+        summary,
+      ]);
+      if (loaded && this.versions.summary === summaryVersion) {
+        const applyStartedAt = performance.now();
+        this.summary = { ...loaded.summary, comparison };
+        this.noteStep("comparison", liveStep, started, comparison, applyStartedAt);
         return "ok";
       }
       return "aborted";
@@ -1619,14 +1628,12 @@ class UsageStore {
     this.loading.pairwise = false;
     this.loading.topSessions = false;
     this.loading.zoom = false;
-    this.zoomRows = null;
   }
 
   private markRefreshComplete(startedAt: number): void {
     this.lastUpdatedAt = Date.now();
     this.lastQueryDurationMs = performance.now() - startedAt;
     this.lastQuerySteps = USAGE_STEP_ORDER.flatMap((name) => this.stepTimings.get(name) ?? []);
-    this.hasNewData = false;
   }
 
   private recordStep(
@@ -1657,7 +1664,7 @@ class UsageStore {
       responseTimingOf(data),
       startedAt,
       performance.now(),
-      this.refreshStartedAt,
+      this.lastFetchStartedAt,
       applyStartedAt,
     );
     this.stepTimings.set(step, timing);

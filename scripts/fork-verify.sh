@@ -218,7 +218,8 @@ fi
 if [ "$WITH_FRONTEND" = "1" ]; then
   step "前端测试"
   if [ -x "$ROOT/frontend/node_modules/.bin/vitest" ]; then
-    if (cd "$ROOT/frontend" && npx vitest run src/lib/utils/agents.test.ts > "$TMPDIR_RUN/fe.log" 2>&1); then
+    # --no-cache：避免 vitest 启动时清理 node_modules/.vite 被工作区安全策略拦截
+    if (cd "$ROOT/frontend" && npx vitest run --no-cache src/lib/utils/agents.test.ts > "$TMPDIR_RUN/fe.log" 2>&1); then
       ok "agents.test.ts 通过"
     else
       bad "前端测试失败："; tail -15 "$TMPDIR_RUN/fe.log" | sed 's/^/      /'; FAILED=1

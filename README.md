@@ -1,7 +1,3 @@
----
-last_edited: 2026-10-22
----
-
 # agentsview
 
 Browse, search, and track costs across your AI coding agents. Your session
@@ -74,7 +70,7 @@ agentsview daemon status   # show daemon status
 agentsview daemon restart  # restart from current configuration
 agentsview daemon stop     # stop the server, web UI, and sync
 agentsview session list    # read from the daemon if warm, otherwise SQLite
-agentsview usage daily     # print daily cost summary
+agentsview report usage daily     # print daily cost summary
 ```
 
 On first run, agentsview discovers sessions from every supported agent on your
@@ -98,16 +94,18 @@ and start one when needed. Dedicated diagnostics such as
 `db adopt-machine --list` and `doctor sync` read the archive without starting
 it. Commands such as `sync`, `usage`, `token-use`, `pg push`, `duckdb push`, and
 `clickhouse push` auto-start the daemon when needed. Daily usage reports read
-saved archive data; run `agentsview sync` first to include new source changes.
-The server remains running after these commands exit and also serves the web UI.
-For a one-shot sync with no background server, stop the daemon first and run
-`AGENTSVIEW_NO_DAEMON=1 agentsview sync`.
+saved archive data; run `agentsview source sync` first to include new source
+changes. The server remains running after these commands exit and also serves
+the web UI. For a one-shot sync with no background server, stop the daemon first
+and run `AGENTSVIEW_NO_DAEMON=1 agentsview source sync`.
 
 Use `agentsview daemon start` when you want to start the writable SQLite daemon
 explicitly. It loads the normal effective configuration from `config.toml` and
 supported environment variables; `daemon start` and `daemon restart` accept no
-serve-specific flags. Background daemons self-exit after an idle period unless a
-client request or daemon-owned job is active.
+serve-specific flags. `daemon start` and `daemon restart` stay running until
+stopped.
+Automatically started daemons self-exit after an idle period unless a client
+request or daemon-owned job is active.
 
 The existing `agentsview serve --background`, `agentsview serve status`, and
 `agentsview serve stop` commands remain available. Use `serve --background` when
@@ -231,23 +229,23 @@ reverse proxy.
 
 ## Token Usage and Cost Tracking
 
-`agentsview usage` tracks token consumption and compute costs across **all**
-your coding agents -- not just Claude Code. Reports read from the same local
-SQLite archive that powers the UI.
+`agentsview report usage` tracks token consumption and compute costs across
+**all** your coding agents -- not just Claude Code. Reports read from the same
+local SQLite archive that powers the UI.
 
 ```bash
 # Daily cost summary (default: last 30 days)
-agentsview usage daily
+agentsview report usage daily
 
 # Per-model breakdown
-agentsview usage daily --breakdown
+agentsview report usage daily --breakdown
 
 # Filter by agent and date range
-agentsview usage daily --agent claude --since 2026-04-01
+agentsview report usage daily --agent claude --since 2026-04-01
 
 # One-line summary for shell prompts / status bars
-agentsview usage daily --all --json
-agentsview usage statusline
+agentsview report usage daily --all --json
+agentsview report usage statusline
 ```
 
 Features:
@@ -278,6 +276,12 @@ agentsview session usage <id>
 agentsview session usage <id> --format json
 ```
 
+To investigate an expensive archived session, run
+`agentsview session diagnose <id>`. It combines usage with context growth,
+compactions, large tool results, retry candidates, and child links. See the
+[diagnosis contract](https://agentsview.io/docs/session-api/#agentsview-session-diagnose)
+for coverage and output options.
+
 The same per-session usage data is available from the REST API:
 
 ```bash
@@ -304,9 +308,9 @@ server, or watcher. See
 
 ## Session Stats
 
-`agentsview stats` emits window-scoped analytics over recorded sessions: totals,
-archetypes (automation vs. quick/standard/deep/marathon), distributions for
-session duration, user-message count, peak context, and tools-per-turn, plus
+`agentsview report stats` emits window-scoped analytics over recorded sessions:
+totals, archetypes (automation vs. quick/standard/deep/marathon), distributions
+for session duration, user-message count, peak context, and tools-per-turn, plus
 cache economics, tool/model/agent mix, and a temporal hourly breakdown. The
 `--format json` output follows a versioned v1 schema (`schema_version: 1`)
 suitable for downstream consumers.
@@ -319,16 +323,16 @@ outcomes).
 
 ```bash
 # Human-readable summary over the last 28 days
-agentsview stats
+agentsview report stats
 
 # Machine-readable JSON over a fixed date range
-agentsview stats --format json --since 2026-04-01 --until 2026-04-15
+agentsview report stats --format json --since 2026-04-01 --until 2026-04-15
 
 # Restrict to one agent and inspect the schema
-agentsview stats --format json --agent claude | jq '.schema_version'
+agentsview report stats --format json --agent claude | jq '.schema_version'
 
 # Include expensive local git outcome metrics explicitly
-agentsview stats --include-git-outcomes
+agentsview report stats --include-git-outcomes
 ```
 
 ## Session Browser
@@ -427,6 +431,7 @@ local Amp thread JSON files.
 | OpenClaw              | `~/.openclaw/agents/`                                                                                                                                                                                                                                |
 | OpenCode              | `~/.local/share/opencode/`                                                                                                                                                                                                                           |
 | Open Code Review      | `~/.opencodereview/sessions/`                                                                                                                                                                                                                        |
+| Open Interpreter      | `~/.openinterpreter/sessions/`, `~/.openinterpreter/archived_sessions/`                                                                                                                                                                              |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                                                                                                        |
 | OMO                   | `~/.omo/agent/sessions/`                                                                                                                                                                                                                             |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                                                                                             |
@@ -482,8 +487,9 @@ or `crush.db` files.
 
 Cline support covers the CLI, not the VS Code extension. Augure Code is tracked
 separately from Codex and resumes through the Augure CLI; its proprietary models
-remain unpriced. Augure Desktop support covers version 3 beta and does not
-include remote sync. See
+remain unpriced. Open Interpreter, which is now a Codex fork, is also tracked
+separately and resumes with `interpreter resume`. Augure Desktop support covers
+version 3 beta and does not include remote sync. See
 [session discovery](https://agentsview.io/docs/configuration/#session-discovery)
 for provider details and limits.
 
@@ -616,10 +622,10 @@ Structured sources are additive to existing `agents.copilot.dirs`,
 `agents.claude.dirs`, and other per-agent settings. They label sessions by
 source machine without namespacing native session IDs. Transport source session
 files only -- never copy `sessions.db` or its WAL files. Machine keys are
-captured at first ingestion; ordinary sync and `agentsview sync --full` preserve
-the stored key. Use a peer's ID from `telemetry-install-id` for remote roots.
-For local roots, omit `machine`, removing any existing hostname setting. Adopted
-old keys remain aliases for existing filters and URLs.
+captured at first ingestion; ordinary sync and `agentsview source sync --full`
+preserve the stored key. Use a peer's ID from `telemetry-install-id` for remote
+roots. For local roots, omit `machine`, removing any existing hostname setting.
+Adopted old keys remain aliases for existing filters and URLs.
 
 See the [Filesystem Session Sync guide](https://agentsview.io/filesystem-sync/)
 for Git, rsync, shared-mount, freshness, and operational guidance.
@@ -629,23 +635,23 @@ for Git, rsync, shared-mount, freshness, and operational guidance.
 Push session data to a shared PostgreSQL instance for team dashboards:
 
 ```bash
-agentsview pg push             # push local data to the default PG target
-agentsview pg push archive     # push to one named PG target
-agentsview pg push --all       # push every configured PG target sequentially
-agentsview pg status           # show status for the default PG target
-agentsview pg status archive   # show status for one named PG target
-agentsview pg status --all     # show status for every configured PG target
-agentsview pg serve            # serve web UI from the default PG target (read-only)
+agentsview replica pg push             # push local data to the default PG target
+agentsview replica pg push archive     # push to one named PG target
+agentsview replica pg push --all       # push every configured PG target sequentially
+agentsview replica pg status           # show status for the default PG target
+agentsview replica pg status archive   # show status for one named PG target
+agentsview replica pg status --all     # show status for every configured PG target
+agentsview replica pg serve            # serve web UI from the default PG target (read-only)
 ```
 
 ```bash
-AGENTSVIEW_DATA_DIR=/data agentsview pg serve --push-watch
+AGENTSVIEW_DATA_DIR=/data agentsview replica pg serve --push-watch
 ```
 
 Use `--push-watch` to ingest mounted sessions and serve them from PostgreSQL in
 one process; see
-[PostgreSQL Sync](https://agentsview.io/docs/pg-sync/#agentsview-pg-serve) for setup
-and shutdown.
+[PostgreSQL Sync](https://agentsview.io/docs/pg-sync/#agentsview-pg-serve) for
+setup and shutdown.
 
 Opt-in [hosted raw processing](docs/hosted-raw-sync.md) lets `pg serve` parse
 uploaded sources directly into PostgreSQL. It requires explicit tenant/schema
@@ -684,10 +690,10 @@ run the auto-push daemon. It watches your session directories and pushes shortly
 after new sessions are recorded, with a periodic floor as a safety net:
 
 ```bash
-agentsview pg push --watch                 # foreground, Ctrl-C to stop
-agentsview pg push archive --watch         # watch one named PG target
-agentsview pg push --watch --debounce 1m   # custom coalesce window
-agentsview pg push --watch --interval 5m   # custom floor interval
+agentsview replica pg push --watch                 # foreground, Ctrl-C to stop
+agentsview replica pg push archive --watch         # watch one named PG target
+agentsview replica pg push --watch --debounce 1m   # custom coalesce window
+agentsview replica pg push --watch --interval 5m   # custom floor interval
 ```
 
 `--watch` follows the default PG target unless you pass one target name.
@@ -706,10 +712,10 @@ To run it unattended as an OS service (launchd on macOS, `systemd --user` on
 Linux):
 
 ```bash
-agentsview pg service install     # generate the unit, enable + start it
-agentsview pg service status      # show manager status
-agentsview pg service logs -f     # follow the service log
-agentsview pg service uninstall   # stop and remove
+agentsview replica pg service install     # generate the unit, enable + start it
+agentsview replica pg service status      # show manager status
+agentsview replica pg service logs -f     # follow the service log
+agentsview replica pg service uninstall   # stop and remove
 ```
 
 `pg serve` and `pg service` always use the effective default PG target. In
@@ -734,11 +740,11 @@ Push session data to a ClickHouse instance. `clickhouse push` writes the copy;
 as PostgreSQL:
 
 ```bash
-agentsview clickhouse push             # push local data to the default target
-agentsview clickhouse push archive     # push to one named target
-agentsview clickhouse push --all       # push every configured target sequentially
-agentsview clickhouse status           # show status for the default target
-agentsview clickhouse serve            # serve web UI from the default target (read-only)
+agentsview replica clickhouse push             # push local data to the default target
+agentsview replica clickhouse push archive     # push to one named target
+agentsview replica clickhouse push --all       # push every configured target sequentially
+agentsview replica clickhouse status           # show status for the default target
+agentsview replica clickhouse serve            # serve web UI from the default target (read-only)
 ```
 
 Single-target configs use the legacy `[clickhouse]` block. To manage more than
@@ -766,8 +772,8 @@ legacy `[clickhouse]` field names `url`, `database`, `machine_name`,
 only to the effective default target.
 
 ```bash
-agentsview clickhouse push --watch                 # foreground, Ctrl-C to stop
-agentsview clickhouse service install              # launchd / systemd --user
+agentsview replica clickhouse push --watch                 # foreground, Ctrl-C to stop
+agentsview replica clickhouse service install              # launchd / systemd --user
 ```
 
 `--all --watch` is rejected. `clickhouse serve` and `clickhouse service` always
@@ -785,19 +791,19 @@ DuckDB when you want a portable analytics file, read-only local serving from a
 mirror, or remote read access through DuckDB's Quack protocol.
 
 ```bash
-agentsview duckdb push          # mirror SQLite into DuckDB
-agentsview duckdb status        # show mirror sync status
-agentsview duckdb serve         # serve web UI from DuckDB (read-only)
-agentsview duckdb quack serve   # expose the local DuckDB file over Quack
+agentsview replica duckdb push          # mirror SQLite into DuckDB
+agentsview replica duckdb status        # show mirror sync status
+agentsview replica duckdb serve         # serve web UI from DuckDB (read-only)
+agentsview replica duckdb quack serve   # expose the local DuckDB file over Quack
 ```
 
-`agentsview duckdb serve` reads `[duckdb].path` or `AGENTSVIEW_DUCKDB_PATH`. To
-serve from a remote Quack endpoint, set `AGENTSVIEW_DUCKDB_URL` and
-`AGENTSVIEW_DUCKDB_TOKEN` instead. Quack is still a new DuckDB protocol, so
-agentsview keeps conservative defaults: local Quack serving binds to loopback,
-requires a token, and rejects non-loopback plain HTTP unless `--allow-insecure`
-is explicit. For remote use, prefer a TLS URL or put Quack behind an
-authenticated tunnel/proxy.
+`agentsview replica duckdb serve` reads `[duckdb].path` or
+`AGENTSVIEW_DUCKDB_PATH`. To serve from a remote Quack endpoint, set
+`AGENTSVIEW_DUCKDB_URL` and `AGENTSVIEW_DUCKDB_TOKEN` instead. Quack is still a
+new DuckDB protocol, so agentsview keeps conservative defaults: local Quack
+serving binds to loopback, requires a token, and rejects non-loopback plain HTTP
+unless `--allow-insecure` is explicit. For remote use, prefer a TLS URL or put
+Quack behind an authenticated tunnel/proxy.
 
 Backend modes:
 

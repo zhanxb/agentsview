@@ -614,18 +614,13 @@ func (c VectorEmbeddingsServerConfig) validate(name string, modelContextTokens i
 	if c.Endpoint == "" && !c.Local {
 		return fmt.Errorf("%s endpoint is required", section)
 	}
-	if c.OllamaCPUFallback {
-		u, err := url.Parse(c.Endpoint)
-		if err != nil || u.Scheme == "" || u.Host == "" ||
-			(u.Scheme != "http" && u.Scheme != "https") {
-			return fmt.Errorf(
-				"%s ollama_cpu_fallback requires an absolute HTTP(S) endpoint", section)
-		}
-		endpointPath := strings.TrimSuffix(u.Path, "/")
-		if !strings.HasSuffix(endpointPath, "/v1") {
-			return fmt.Errorf(
-				"%s ollama_cpu_fallback requires an endpoint ending in /v1", section)
-		}
+	endpoint, err := c.EmbedDeployment().Canonical()
+	if err != nil && !c.Local {
+		return fmt.Errorf("%s %w", section, err)
+	}
+	if c.OllamaCPUFallback && !strings.HasSuffix(endpoint, "/v1") {
+		return fmt.Errorf(
+			"%s ollama_cpu_fallback requires an endpoint ending in /v1", section)
 	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("%s batch_size must be greater than 0, got %d", section, c.BatchSize)
@@ -692,6 +687,46 @@ type FrictionConfig struct {
 	BackfillDays int `json:"backfill_days" toml:"backfill_days"`
 	// SeatPatterns are globs over session file paths with one {seat} capture.
 	SeatPatterns []string `json:"seat_patterns,omitempty" toml:"seat_patterns"`
+	// Kata is the hub's automatic filing policy.
+	Kata FrictionKataConfig `json:"kata,omitzero" toml:"kata"`
+}
+
+// FrictionKataConfig controls automatic filing of Friction Log patterns to
+// Kata. Only the filing hub with [kata] enabled acts on it.
+type FrictionKataConfig struct {
+	// AutoFile files recent unlinked patterns every hour.
+	AutoFile bool `json:"auto_file,omitempty" toml:"auto_file"`
+	// Kinds limits automatic filing to these kinds; empty means every kind
+	// that can be filed.
+	Kinds []string `json:"kinds,omitempty" toml:"kinds"`
+	// MinSessions is how many sessions a pattern must appear in before it
+	// is filed automatically; 0 means DefaultFrictionAutoFileMinSessions.
+	MinSessions int `json:"min_sessions,omitempty" toml:"min_sessions"`
+}
+
+// DefaultFrictionAutoFileMinSessions files only patterns that recur across
+// sessions. Correction, pattern and deferral fingerprints include the
+// session, so at this default they are filed only by hand.
+const DefaultFrictionAutoFileMinSessions = 2
+
+// FileMinSessions returns the session count automatic filing requires.
+func (c FrictionKataConfig) FileMinSessions() int {
+	if c.MinSessions == 0 {
+		return DefaultFrictionAutoFileMinSessions
+	}
+	return c.MinSessions
+}
+
+// FileKinds returns the kinds automatic filing considers.
+func (c FrictionKataConfig) FileKinds() []friction.Kind {
+	if len(c.Kinds) == 0 {
+		return friction.FileableKinds
+	}
+	out := make([]friction.Kind, 0, len(c.Kinds))
+	for _, k := range c.Kinds {
+		out = append(out, friction.Kind(k))
+	}
+	return out
 }
 
 // Validate checks the zone name, backfill bound, and seat patterns.
@@ -714,6 +749,19 @@ func (c FrictionConfig) Validate() error {
 	}
 	if _, err := friction.CompileSeatPatterns(c.SeatPatterns); err != nil {
 		return fmt.Errorf("[friction] seat_patterns: %w", err)
+	}
+	seen := make(map[string]bool, len(c.Kata.Kinds))
+	for _, k := range c.Kata.Kinds {
+		if !friction.Fileable(friction.Kind(k)) {
+			return fmt.Errorf("[friction.kata] kinds entry %q cannot be filed; use correction, error, workaround, deferral or pattern", k)
+		}
+		if seen[k] {
+			return fmt.Errorf("[friction.kata] kinds entry %q repeats", k)
+		}
+		seen[k] = true
+	}
+	if c.Kata.MinSessions < 0 {
+		return fmt.Errorf("[friction.kata] min_sessions must be at least 1, got %d", c.Kata.MinSessions)
 	}
 	return nil
 }
@@ -983,7 +1031,10 @@ type sessionSourceConfig struct {
 type Config struct {
 	// CodexCloud is the [agents.codex-cloud] table, read from config.toml
 	// only.
-	CodexCloud           CodexCloudConfig            `json:"-" toml:"-"`
+	CodexCloud CodexCloudConfig `json:"-" toml:"-"`
+	// ClaudeAI is the organizations setting of [agents.claude-ai], read
+	// from config.toml only.
+	ClaudeAI             ClaudeAIConfig              `json:"-" toml:"-"`
 	Host                 string                      `json:"host" toml:"host"`
 	Port                 int                         `json:"port" toml:"port"`
 	ChartPalette         ChartPalette                `json:"chart_palette" toml:"chart_palette"`
@@ -1005,6 +1056,7 @@ type Config struct {
 	RequireAuth          bool                        `json:"require_auth" toml:"require_auth"`
 	NoBrowser            bool                        `json:"no_browser" toml:"no_browser"`
 	DisableUpdateCheck   bool                        `json:"disable_update_check" toml:"disable_update_check"`
+	PersistentDaemon     bool                        `json:"-" toml:"-"`
 	NoSync               bool                        `json:"-" toml:"-"`
 	SkipInitialSync      bool                        `json:"-" toml:"-"`
 	ArchiveContent       ArchiveContent              `json:"archive_content" toml:"archive_content"`
@@ -1017,6 +1069,7 @@ type Config struct {
 	DuckDB               DuckDBConfig                `json:"duckdb,omitempty" toml:"duckdb"`
 	Vector               VectorConfig                `json:"vector,omitempty" toml:"vector"`
 	Recall               RecallConfig                `json:"recall,omitempty" toml:"recall"`
+	Integrations         IntegrationsConfig          `json:"integrations,omitempty" toml:"integrations"`
 	Insights             InsightsConfig              `json:"insights,omitempty" toml:"insights"`
 	Kata                 KataConfig                  `json:"-" toml:"kata"`
 	Friction             FrictionConfig              `json:"friction,omitempty" toml:"friction"`
@@ -1083,7 +1136,12 @@ type Config struct {
 	// work during bursts of sync activity. Zero disables coalescing.
 	EventsCoalesceInterval time.Duration `json:"events_coalesce_interval,omitzero" toml:"events_coalesce_interval"`
 
+	// SyncIdleAfter pauses local ingestion after client inactivity. Restart to apply changes.
+	SyncIdleAfter     time.Duration `json:"sync_idle_after,omitzero" toml:"sync_idle_after"`
 	DaemonIdleTimeout time.Duration `json:"daemon_idle_timeout,omitzero" toml:"daemon_idle_timeout"`
+
+	// SyncInterval is the minimum time between starts of watcher-triggered syncs.
+	SyncInterval time.Duration `json:"sync_interval,omitzero" toml:"sync_interval"`
 
 	ModelAliases       map[string]string          `json:"model_aliases,omitempty" toml:"model_aliases"`
 	CustomModelPricing map[string]CustomModelRate `json:"custom_model_pricing,omitempty" toml:"custom_model_pricing"`
@@ -1401,6 +1459,8 @@ func Default() (Config, error) {
 		ResultContentBlockedCategories: []string{"Read", "Glob"},
 		EventsCoalesceInterval:         10 * time.Second,
 		DaemonIdleTimeout:              20 * time.Minute,
+		SyncIdleAfter:                  10 * time.Minute,
+		SyncInterval:                   5 * time.Second,
 		Agent:                          map[string]AgentConfig{},
 		CodexCloud:                     defaultCodexCloudConfig(),
 		Vector: VectorConfig{
@@ -1850,6 +1910,7 @@ func (c *Config) applyConfigTOML(data string) error {
 		DuckDB                         DuckDBConfig           `toml:"duckdb"`
 		Vector                         VectorConfig           `toml:"vector"`
 		Recall                         RecallConfig           `toml:"recall"`
+		Integrations                   IntegrationsConfig     `toml:"integrations"`
 		Insights                       InsightsConfig         `toml:"insights"`
 		Kata                           KataConfig             `toml:"kata"`
 		Friction                       FrictionConfig         `toml:"friction"`
@@ -1857,6 +1918,8 @@ func (c *Config) applyConfigTOML(data string) error {
 		Agent                          map[string]AgentConfig `toml:"agent"`
 		EventsCoalesceInterval         time.Duration          `toml:"events_coalesce_interval"`
 		DaemonIdleTimeout              time.Duration          `toml:"daemon_idle_timeout"`
+		SyncIdleAfter                  time.Duration          `toml:"sync_idle_after"`
+		SyncInterval                   time.Duration          `toml:"sync_interval"`
 		RemoteHosts                    []RemoteHost           `toml:"remote_hosts"`
 		ArchiveSources                 []ArchiveSource        `toml:"archive_sources"`
 		SessionSources                 []sessionSourceConfig  `toml:"session_sources"`
@@ -2171,6 +2234,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Vector.Embed.BackstopInterval = file.Vector.Embed.BackstopInterval
 	}
 	c.mergeRecallExtractTOML(file.Recall, meta)
+	if meta.IsDefined("integrations") {
+		c.Integrations = file.Integrations
+	}
 	if meta.IsDefined("insights") {
 		c.Insights = file.Insights
 		c.Insights.Endpoint = strings.TrimSpace(c.Insights.Endpoint)
@@ -2192,6 +2258,18 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("friction", "backfill_days") {
 		c.Friction.BackfillDays = file.Friction.BackfillDays
 	}
+	if meta.IsDefined("friction", "kata", "auto_file") {
+		c.Friction.Kata.AutoFile = file.Friction.Kata.AutoFile
+	}
+	if meta.IsDefined("friction", "kata", "min_sessions") {
+		c.Friction.Kata.MinSessions = file.Friction.Kata.MinSessions
+	}
+	if meta.IsDefined("friction", "kata", "kinds") {
+		c.Friction.Kata.Kinds = make([]string, 0, len(file.Friction.Kata.Kinds))
+		for _, k := range file.Friction.Kata.Kinds {
+			c.Friction.Kata.Kinds = append(c.Friction.Kata.Kinds, strings.TrimSpace(k))
+		}
+	}
 	if meta.IsDefined("friction", "seat_patterns") {
 		c.Friction.SeatPatterns = make([]string, 0, len(file.Friction.SeatPatterns))
 		for _, p := range file.Friction.SeatPatterns {
@@ -2206,8 +2284,14 @@ func (c *Config) applyConfigTOML(data string) error {
 	if meta.IsDefined("events_coalesce_interval") {
 		c.EventsCoalesceInterval = file.EventsCoalesceInterval
 	}
+	if meta.IsDefined("sync_idle_after") {
+		c.SyncIdleAfter = file.SyncIdleAfter
+	}
 	if meta.IsDefined("daemon_idle_timeout") {
 		c.DaemonIdleTimeout = file.DaemonIdleTimeout
+	}
+	if meta.IsDefined("sync_interval") {
+		c.SyncInterval = file.SyncInterval
 	}
 	if file.Automated.Prefixes != nil {
 		c.Automated.Prefixes = file.Automated.Prefixes
@@ -2256,6 +2340,7 @@ func (c *Config) applyConfigTOML(data string) error {
 	}
 
 	c.CodexCloud = parseCodexCloudTable(c.configPath(), raw["agents"])
+	c.ClaudeAI = parseClaudeAITable(c.configPath(), raw["agents"])
 	if err := c.applyAgentDirectories(raw["agents"]); err != nil {
 		return err
 	}
@@ -4062,4 +4147,74 @@ func (c *Config) SaveGithubToken(token string) error {
 		c.GithubToken = token
 		return nil
 	})
+}
+
+// ErrInvalidVectorSetup marks settings a vector setup would reject, as
+// opposed to failures reading or locking the config file.
+var ErrInvalidVectorSetup = errors.New("invalid vector setup")
+
+type invalidVectorSetupError struct{ error }
+
+func (e invalidVectorSetupError) Unwrap() error { return e.error }
+
+func (invalidVectorSetupError) Is(target error) bool { return target == ErrInvalidVectorSetup }
+
+// VectorSetupEmbeddings returns the validated embeddings recipe SaveVectorSetup
+// would save now, so status and activation select the same provider.
+func (c *Config) VectorSetupEmbeddings() (VectorEmbeddingsConfig, error) {
+	var embeddings VectorEmbeddingsConfig
+	err := c.withConfigLock(func() error {
+		_, candidate, err := c.vectorSetupCandidate()
+		if err == nil {
+			embeddings = candidate.Vector.Embeddings
+		}
+		return err
+	})
+	return embeddings, err
+}
+
+// SaveVectorSetup records the selected action while keeping omitted defaults omitted.
+func (c *Config) SaveVectorSetup() error {
+	return c.withConfigLock(func() error {
+		existing, _, err := c.vectorSetupCandidate()
+		if err != nil {
+			return err
+		}
+		return c.writeConfigMap(existing)
+	})
+}
+
+func (c *Config) vectorSetupCandidate() (map[string]any, Config, error) {
+	existing, err := c.readConfigMap()
+	if err != nil {
+		if _, ok := errors.AsType[toml.ParseError](err); ok {
+			err = invalidVectorSetupError{err}
+		}
+		return nil, Config{}, err
+	}
+	section, ok := existing["vector"].(map[string]any)
+	if !ok && existing["vector"] != nil {
+		return nil, Config{}, invalidVectorSetupError{errors.New("vector must be a table")}
+	}
+	if section == nil {
+		section = make(map[string]any)
+	}
+	section["enabled"] = true
+	existing["vector"] = section
+	encoded, err := toml.Marshal(existing)
+	if err != nil {
+		return nil, Config{}, err
+	}
+	candidate, err := Default()
+	if err != nil {
+		return nil, Config{}, err
+	}
+	candidate.DataDir = c.DataDir
+	if err := candidate.applyConfigTOML(string(encoded)); err != nil {
+		return nil, Config{}, invalidVectorSetupError{err}
+	}
+	if err := candidate.Vector.Validate(); err != nil {
+		return nil, Config{}, invalidVectorSetupError{err}
+	}
+	return existing, candidate, nil
 }

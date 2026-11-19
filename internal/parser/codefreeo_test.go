@@ -162,7 +162,7 @@ func TestCodeFreeOSQLiteMetaRejectsForeignContainer(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_cf")
 
-	metas, err := ListCodeFreeOSessionMeta(dbPath)
+	metas, err := ListCodeFreeOSessionMeta(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.Len(t, metas, 1)
 	assert.True(t, strings.HasPrefix(

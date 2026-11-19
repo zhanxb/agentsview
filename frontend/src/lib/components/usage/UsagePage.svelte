@@ -57,9 +57,45 @@
   } from "../../stores/yokedDates.svelte.js";
   import { m } from "../../i18n/index.js";
   import { usageChartStyleMaps } from "../../utils/usageChartStyles.js";
+  import { localDateStr } from "../../utils/dates.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
+  let pendingRefresh = false;
+  let visible = $state(!document.hidden);
+  let urlInitRan = $state(false);
+  let urlWritebackReady = $state(false);
+  const refreshReady = $derived(
+    visible && urlInitRan && urlWritebackReady && !sessions.machineFilterPending,
+  );
+
+  function refreshUsage(): void {
+    if (!refreshReady) {
+      pendingRefresh = true;
+      return;
+    }
+    pendingRefresh = false;
+    void usage.fetchAll({ preserveTimeRange: true });
+  }
+
+  function onVisibilityChange(): void {
+    visible = !document.hidden;
+    if (document.hidden) {
+      if (usage.isQuerying) {
+        pendingRefresh = true;
+        usage.cancelInFlightReads();
+      }
+    } else {
+      if (pendingRefresh) refreshUsage();
+      else usage.markNewData();
+    }
+  }
+
+  $effect(() => {
+    if (!usage.hasNewData || !refreshReady || usage.isQuerying) return;
+    const timer = setTimeout(refreshUsage, Math.max(0, usage.lastFetchStartedAt + 60_000 - performance.now()));
+    return () => clearTimeout(timer);
+  });
 
   const chartStyleMaps = $derived(
     usageChartStyleMaps(
@@ -87,14 +123,31 @@
       : 0,
   );
 
-  const agentItems = $derived(
-    sessions.agents.map((a) => ({
-      name: a.name,
-      count: a.session_count,
-    })),
-  );
+  $effect(() => {
+    const summaryAgents = ((usage.attributionSummary ?? usage.summary)?.agentTotals ?? [])
+      .map((agent) => ({ name: agent.agent }));
+    const sessionAgents = sessions.agents.map((agent) => ({
+      name: agent.name, count: agent.session_count,
+    }));
+    const filteredAgents = [usage.excludedAgents, sessions.filters.agent]
+      .flatMap((csv) => csv.split(",").filter(Boolean).map((name) => ({ name })));
+    untrack(() => {
+      const agents = new Map(usage.knownAgents.map((agent) => [agent.name, agent]));
+      for (const agent of [...summaryAgents, ...sessionAgents, ...filteredAgents]) {
+        agents.set(agent.name, { ...agents.get(agent.name), ...agent });
+      }
+      usage.knownAgents = [...agents.values()].sort((a, b) => a.name.localeCompare(b.name));
+    });
+  });
 
-  const earliestSession = $derived(sync.stats?.earliest_session ?? null);
+  const agentItems = $derived(usage.knownAgents);
+
+  const earliestUsage = $derived(
+    [sync.stats?.earliest_session, sync.stats?.earliest_account_usage]
+      .filter((timestamp): timestamp is string => !!timestamp)
+      .map((timestamp) => localDateStr(new Date(timestamp)))
+      .sort()[0] ?? null,
+  );
 
   const rangeSelection = $derived(
     selectionFromWindow({
@@ -102,7 +155,7 @@
       windowDays: usage.windowDays,
       from: usage.from,
       to: usage.to,
-      earliestSession,
+      earliestSession: earliestUsage,
     }),
   );
 
@@ -114,7 +167,7 @@
         windowDays: sel.days,
       }));
     } else {
-      const range = resolveRange(sel, earliestSession);
+      const range = resolveRange(sel, earliestUsage);
       usage.setDateRange(range.from, range.to);
       updateYokeFromUsage(panelDateState(range.from, range.to, {
         mode: "fixed",
@@ -226,8 +279,6 @@
     return supported;
   }
 
-  let urlInitRan = $state(false);
-  let urlWritebackReady = $state(false);
   let initialFetchDone = $state(false);
 
   function selectUsageMode(mode: UsageMode): void {
@@ -432,18 +483,16 @@
       if (!initialFetchDone) {
         initialFetchDone = true;
       }
-      usage.fetchAll({ preserveTimeRange: true });
+      refreshUsage();
     });
   });
 
   onMount(() => {
     mounted = true;
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // The Agent dropdown reads sessions.agents, which is otherwise loaded
     // lazily by the sidebar filter control; a direct /usage visit needs it too.
     sessions.loadAgents();
-    // SSE events only flag new data; RefreshControl owns the periodic refresh
-    // and the manual button. The initial and filter-change fetches run from the
-    // effects above once URL/filter state is hydrated.
     unsubEvents = events.subscribe(() => usage.markNewData());
     tick().then(() => {
       urlWritebackReady = true;
@@ -451,6 +500,7 @@
   });
 
   onDestroy(() => {
+    document.removeEventListener("visibilitychange", onVisibilityChange);
     usage.cancelInFlightReads();
     unsubEvents?.();
   });
@@ -488,7 +538,7 @@
       <RangePicker
         selection={rangeSelection}
         busy={usage.isQuerying}
-        {earliestSession}
+        earliestSession={earliestUsage}
         onSelect={applyRange}
       />
 
@@ -532,7 +582,7 @@
         querySteps={usage.lastQuerySteps}
         liveQuery={usage.liveQuery}
         busy={usage.isQuerying}
-        onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
+        onRefresh={(reason) => reason === "manual" ? refreshUsage() : usage.markNewData()}
         label={m.usage_refresh()}
         title={m.shared_refresh()}
       />
