@@ -319,10 +319,19 @@ Lockfile pin b725eda... for `dtolnay/rust-toolchain` does not match ref `stable`
 ```
 
 原因通常是上游发版后 `stable` 分支又前进了，而 tag 里的 lockfile 没更新（上游后来在 main
-上把 `@stable` 改成了 `@master` 来规避）。修法：对照上游 main 的最新
-`.github/workflows/actions.lock`，把 workflow/action 里的引用与 lockfile 条目同步改成
-`@master` 和对应的新 SHA（可用 API 查 `commits/master` 验证 SHA 有效）。
-这次的修复提交是 `68f6dab0`。
+上把 `@stable` 改成了 `@master` 来规避）。修法分两步，缺一不可：
+
+1. 把 `.github/actions/build-desktop-artifact/action.yml` 里的
+   `dtolnay/rust-toolchain@stable` 改成 `@master`（共两处：主安装和重试），
+   并给每一处加 `with: toolchain: stable`——**`@master` 不像 `@stable` 那样隐含 stable，
+   不传这个输入会报 `'toolchain' is a required input`，job 照样失败**；
+2. 同步 `.github/workflows/actions.lock`：把引用和条目里的 `stable` 改成 `master`，
+   commit 换成 `dtolnay/rust-toolchain` 仓库 `master` 分支当前的 HEAD
+   （用 `https://api.github.com/repos/dtolnay/rust-toolchain/commits/master` 查，
+   并确认 API 返回 200；fork 环境下 `gh actions-lock` 工具不可用，手动改等价）。
+
+这次的修复提交是 `68f6dab0` + `9e44f340`。上游最终在新版里干脆移除了这个 action，
+所以长远看跟随新 tag 后此问题会自然消失。
 
 ### 前端测试报 safe-delete / SAFE_DELETE_BULK_CONFIRM_REQUIRED
 
